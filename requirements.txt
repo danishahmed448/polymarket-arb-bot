@@ -1,3 +1,5 @@
 py-clob-client
 requests
 pandas
+web3
+eth-account
