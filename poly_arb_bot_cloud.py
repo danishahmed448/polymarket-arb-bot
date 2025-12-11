@@ -16,7 +16,8 @@ from py_clob_client.order_builder.constants import BUY
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
 MIN_SPREAD_TARGET = 1.0       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
-BET_SIZE = 2.0                # Reduced for better fills on both sides
+BET_SIZE = 5.0                # Must be at least $5 to meet minimum 5 share requirement
+MIN_SHARES = 5.0              # Polymarket minimum order size
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -686,9 +687,9 @@ class RealMoneyClient:
             # CRITICAL: Round shares to exactly 2 decimal places (API requirement)
             equal_shares = round(raw_shares, 2)
             
-            # Ensure minimum viable shares
-            if equal_shares < 0.01:
-                logger.warning("Shares too small after rounding, skipping trade")
+            # Ensure minimum viable shares (Polymarket requires minimum 5 shares)
+            if equal_shares < MIN_SHARES:
+                logger.warning(f"Shares {equal_shares} < minimum {MIN_SHARES}, skipping trade")
                 return False
             
             # Calculate expected profit
