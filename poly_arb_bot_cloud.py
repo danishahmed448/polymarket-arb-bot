@@ -288,48 +288,55 @@ class ArbitrageBot:
                     'active': 'true',
                     'closed': 'false',
                     'tag_id': TAG_UP_OR_DOWN,
-                    'limit': 200  # Fetch more to find crypto markets
+                    'limit': 200
                 },
                 timeout=15
             )
             
-            if resp.status_code == 200:
-                data = resp.json()
-                # Safety check for list format
-                if isinstance(data, list):
-                    markets = data
-                elif isinstance(data, dict) and 'markets' in data:
-                    markets = data['markets']
-                else:
-                    return
+            if resp.status_code != 200:
+                logger.error(f"API returned {resp.status_code}")
+                return
+            
+            data = resp.json()
+            
+            # Safety check for list format
+            if isinstance(data, list):
+                markets = data
+            elif isinstance(data, dict) and 'markets' in data:
+                markets = data['markets']
+            else:
+                logger.warning(f"Unexpected response format: {type(data)}")
+                return
+            
+            logger.info(f"📡 API returned {len(markets)} raw markets")
 
-                found = []
-                for m in markets:
-                    if m.get('closed') or not m.get('active', True): 
-                        continue
-                    
-                    # Filter: Must contain "Up or Down" AND crypto keyword
-                    q = m.get('question', '').lower()
-                    if 'up or down' not in q:
-                        continue
-                    if not any(kw in q for kw in CRYPTO_KEYWORDS):
-                        continue
-                    
-                    try:
-                        clob_ids_str = m.get('clobTokenIds', '[]')
-                        clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                    except: 
-                        clob_ids = []
-                    
-                    if clob_ids and len(clob_ids) >= 2:
-                        m['_tokens'] = clob_ids
-                        found.append(m)
+            found = []
+            for m in markets:
+                if m.get('closed') or not m.get('active', True): 
+                    continue
                 
-                self.target_markets = found
-                self.last_scan_time = time.time()
-                with status_lock:
-                    bot_status['markets_count'] = len(found)
-                logger.info(f"🔍 Scanned: {len(found)} crypto Up/Down markets")
+                # Filter: Must contain "Up or Down" AND crypto keyword
+                q = m.get('question', '').lower()
+                if 'up or down' not in q:
+                    continue
+                if not any(kw in q for kw in CRYPTO_KEYWORDS):
+                    continue
+                
+                try:
+                    clob_ids_str = m.get('clobTokenIds', '[]')
+                    clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
+                except: 
+                    clob_ids = []
+                
+                if clob_ids and len(clob_ids) >= 2:
+                    m['_tokens'] = clob_ids
+                    found.append(m)
+            
+            self.target_markets = found
+            self.last_scan_time = time.time()
+            with status_lock:
+                bot_status['markets_count'] = len(found)
+            logger.info(f"🔍 Scanned: {len(found)} crypto Up/Down markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
