@@ -1130,7 +1130,7 @@ class ArbitrageBot:
                 if ask_up is None or ask_down is None: return None
 
                 total = ask_up + ask_down
-                q = market.get('question', '')[:40]
+                q = market.get('question', '')
                 market['_last_spread'] = total
                 
                 # Get coin and timeframe
