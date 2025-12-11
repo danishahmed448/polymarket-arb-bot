@@ -652,14 +652,17 @@ class RealMoneyClient:
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares):
         """
-        Execute paired FOK buy orders using MarketOrderArgs.
+        Execute paired buy orders with EQUAL SHARES on both sides.
         
-        FIX for GitHub Issue #121:
-        - Use MarketOrderArgs to specify CASH amount directly (always 2 decimals)
-        - Use 'price' field as limit cap for protection
-        - FOK ensures both fill or neither (no partial fill risk)
+        CRITICAL for arbitrage:
+        - Must buy SAME number of shares on UP and DOWN
+        - Only then can we merge pairs for guaranteed $1.00 payout
+        - Unequal shares = unhedged directional risk!
         
-        https://github.com/Polymarket/py-clob-client/issues/121
+        Strategy:
+        - Use OrderArgs with exact SHARES (rounded to 2 decimals)
+        - Use GTC orders (FOK has precision issues per GitHub #121)
+        - If first order succeeds but second fails, cancel first
         """
         if self.client is None:
             logger.error("❌ Cannot trade: CLOB Client not connected!")
@@ -669,74 +672,89 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
-            # Calculate CASH amount per side (must be exactly 2 decimals)
-            # Spend half of BET_SIZE on each side
-            cash_per_side = round(BET_SIZE / 2, 2)  # e.g., $2.50 if BET_SIZE = $5
+            # Calculate the cost and validate spread
+            total_spread = up_price + down_price
+            if total_spread >= 1.00:
+                logger.info(f"Spread {total_spread:.4f} >= 1.00, no profit, skipping")
+                return False
             
-            # Ensure minimum viable amount
-            if cash_per_side < 0.10:
-                logger.warning("Cash amount too small, skipping trade")
+            # Calculate how many EQUAL shares we can buy with BET_SIZE
+            # Cost per pair = up_price + down_price
+            # Shares = BET_SIZE / (up_price + down_price)
+            raw_shares = BET_SIZE / total_spread
+            
+            # CRITICAL: Round shares to exactly 2 decimal places (API requirement)
+            equal_shares = round(raw_shares, 2)
+            
+            # Ensure minimum viable shares
+            if equal_shares < 0.01:
+                logger.warning("Shares too small after rounding, skipping trade")
                 return False
             
             # Calculate expected profit
-            total_spread = up_price + down_price
-            if total_spread >= 1.00:
-                logger.info(f"Spread {total_spread:.4f} too tight, skipping")
-                return False
+            cost = equal_shares * total_spread
+            payout = equal_shares * 1.00  # Merge pays $1 per pair
+            profit = payout - cost
             
-            # Add small price padding for slippage protection (1 cent)
-            max_price_yes = round(up_price + 0.01, 2)
-            max_price_no = round(down_price + 0.01, 2)
+            # Round prices to 2 decimals
+            safe_price_yes = round(up_price, 2)
+            safe_price_no = round(down_price, 2)
             
-            # Ensure prices don't exceed 0.99
-            max_price_yes = min(max_price_yes, 0.99)
-            max_price_no = min(max_price_no, 0.99)
-            
-            logger.info(f"🔫 Sending FOK Market Orders (MarketOrderArgs):")
-            logger.info(f"   YES: ${cash_per_side} @ max {max_price_yes}")
-            logger.info(f"   NO:  ${cash_per_side} @ max {max_price_no}")
-            logger.info(f"   Total spend: ${cash_per_side * 2}")
+            logger.info(f"🎯 Sending EQUAL SHARE Orders (Proper Arbitrage):")
+            logger.info(f"   SHARES: {equal_shares} on BOTH sides")
+            logger.info(f"   YES: {equal_shares} shares @ {safe_price_yes}")
+            logger.info(f"   NO:  {equal_shares} shares @ {safe_price_no}")
+            logger.info(f"   Total cost: ${cost:.2f} | Payout: ${payout:.2f} | Profit: ${profit:.4f}")
 
-            # Create Market Orders with CASH amount (not shares!)
-            # Including 'price' acts as a limit cap for protection
-            order_args_yes = MarketOrderArgs(
+            # Create Order Args with EQUAL SHARES
+            order_args_yes = OrderArgs(
                 token_id=token_yes,
-                amount=cash_per_side,  # Spend exactly $X (2 decimals = compliant)
-                side=BUY,
-                price=max_price_yes    # Protection: Don't buy if price spikes!
+                price=safe_price_yes,
+                size=equal_shares,  # EQUAL shares on both sides!
+                side=BUY
             )
-            
-            order_args_no = MarketOrderArgs(
+            order_args_no = OrderArgs(
                 token_id=token_no,
-                amount=cash_per_side,  # Spend exactly $X (2 decimals = compliant)
-                side=BUY,
-                price=max_price_no     # Protection
+                price=safe_price_no,
+                size=equal_shares,  # EQUAL shares on both sides!
+                side=BUY
             )
             
-            # Create and post using create_market_order (not create_order!)
-            signed_yes = self.client.create_market_order(order_args_yes)
-            resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
+            # Post YES order first (using GTC to avoid FOK precision issues)
+            signed_yes = self.client.create_order(order_args_yes)
+            resp_yes = self.client.post_order(signed_yes, OrderType.GTC)
             logger.info(f"YES Order Response: {resp_yes}")
             
-            signed_no = self.client.create_market_order(order_args_no)
-            resp_no = self.client.post_order(signed_no, OrderType.FOK)
+            yes_success = resp_yes.get("success", False) if isinstance(resp_yes, dict) else False
+            yes_order_id = resp_yes.get("orderID") if isinstance(resp_yes, dict) else None
+            
+            if not yes_success:
+                logger.error(f"❌ YES order failed: {resp_yes}")
+                return False
+            
+            # Post NO order
+            signed_no = self.client.create_order(order_args_no)
+            resp_no = self.client.post_order(signed_no, OrderType.GTC)
             logger.info(f"NO Order Response: {resp_no}")
             
-            # Check success
-            yes_success = resp_yes.get("success", False) if isinstance(resp_yes, dict) else False
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
-
-            if yes_success and no_success:
-                logger.info(f"✅ REAL TRADE EXECUTED: Spent ${cash_per_side * 2:.2f} total.")
-                self.total_trades += 1
-                return True
-            else:
-                logger.error(f"❌ Trade Failed. Yes:{yes_success} No:{no_success}")
-                if not yes_success: 
-                    logger.error(f"Reason YES: {resp_yes}")
-                if not no_success: 
-                    logger.error(f"Reason NO: {resp_no}")
+            
+            if not no_success:
+                # CRITICAL: Cancel YES order to avoid unhedged position!
+                logger.error(f"❌ NO order failed: {resp_no}")
+                if yes_order_id:
+                    try:
+                        self.client.cancel(yes_order_id)
+                        logger.info(f"🔄 Cancelled YES order {yes_order_id} to avoid unhedged position")
+                    except Exception as ce:
+                        logger.error(f"⚠️ Failed to cancel YES order: {ce}")
                 return False
+
+            # Both orders posted successfully
+            logger.info(f"✅ ARBITRAGE EXECUTED: {equal_shares} pairs @ spread {total_spread:.4f}")
+            logger.info(f"   Expected profit after merge: ${profit:.4f}")
+            self.total_trades += 1
+            return True
                 
         except Exception as e:
             logger.error(f"Real Trade Exception: {e}")
