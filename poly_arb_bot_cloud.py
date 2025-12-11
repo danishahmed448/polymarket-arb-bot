@@ -20,7 +20,8 @@ BET_SIZE = 2.0                # Reduced for better fills on both sides
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
-TAG_15M = 102467
+TAG_UP_OR_DOWN = 102127         # "Up or Down" tag (contains all timeframe markets)
+CRYPTO_KEYWORDS = ['bitcoin', 'solana', 'ethereum', 'xrp']  # Filter for crypto only
 WEB_PORT = int(os.environ.get('PORT', 8080))
 
 # Speed Optimization Settings
@@ -280,7 +281,18 @@ class ArbitrageBot:
 
     def scan_markets(self):
         try:
-            resp = requests.get(f"{GAMMA_API_URL}/markets", params={'active': 'true', 'closed': 'false', 'tag_id': TAG_15M, 'limit': 50}, timeout=15)
+            # Fetch from "Up or Down" tag which contains all crypto timeframe markets
+            resp = requests.get(
+                f"{GAMMA_API_URL}/markets",
+                params={
+                    'active': 'true',
+                    'closed': 'false',
+                    'tag_id': TAG_UP_OR_DOWN,
+                    'limit': 200  # Fetch more to find crypto markets
+                },
+                timeout=15
+            )
+            
             if resp.status_code == 200:
                 data = resp.json()
                 # Safety check for list format
@@ -293,12 +305,21 @@ class ArbitrageBot:
 
                 found = []
                 for m in markets:
-                    if m.get('closed') or not m.get('active', True): continue
+                    if m.get('closed') or not m.get('active', True): 
+                        continue
+                    
+                    # Filter: Must contain "Up or Down" AND crypto keyword
+                    q = m.get('question', '').lower()
+                    if 'up or down' not in q:
+                        continue
+                    if not any(kw in q for kw in CRYPTO_KEYWORDS):
+                        continue
                     
                     try:
                         clob_ids_str = m.get('clobTokenIds', '[]')
                         clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                    except: clob_ids = []
+                    except: 
+                        clob_ids = []
                     
                     if clob_ids and len(clob_ids) >= 2:
                         m['_tokens'] = clob_ids
@@ -308,7 +329,7 @@ class ArbitrageBot:
                 self.last_scan_time = time.time()
                 with status_lock:
                     bot_status['markets_count'] = len(found)
-                logger.info(f"🔍 Scanned: {len(found)} markets")
+                logger.info(f"🔍 Scanned: {len(found)} crypto Up/Down markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
