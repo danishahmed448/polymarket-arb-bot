@@ -67,6 +67,46 @@ ENABLED_TIMEFRAMES = {
 
 COINS = ['bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'xrp']
 
+
+def detect_coin(text):
+    """Detect which coin from text."""
+    text = text.lower()
+    if 'bitcoin' in text or 'btc' in text:
+        return 'BTC'
+    elif 'ethereum' in text or 'eth ' in text or text.startswith('eth'):
+        return 'ETH'
+    elif 'solana' in text or 'sol ' in text or text.startswith('sol'):
+        return 'SOL'
+    elif 'xrp' in text:
+        return 'XRP'
+    return None
+
+
+def is_market_live(market, event):
+    """Check if market is currently live (not closed, not past end date)."""
+    from datetime import datetime, timezone
+    
+    if market.get('closed') == True:
+        return False
+    
+    end_date = market.get('endDate') or market.get('end_date_iso') or event.get('endDate')
+    if end_date:
+        try:
+            if isinstance(end_date, str):
+                if end_date.endswith('Z'):
+                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
+                else:
+                    end_dt = datetime.fromisoformat(end_date)
+                
+                now = datetime.now(timezone.utc)
+                if end_dt < now:
+                    return False
+        except:
+            pass
+    
+    return True
+
+
 # Speed Optimization Settings
 MAX_WORKERS = 10              # Parallel order book fetches
 MAX_REQUESTS_PER_SECOND = 8   # Rate limit to avoid 429s
@@ -134,79 +174,441 @@ class DashboardHandler(BaseHTTPRequestHandler):
             best_spread = bot_status['best_spread']
             checks = bot_status['checks']
             last_update = bot_status['last_update']
-            recent_checks = list(bot_status.get('recent_checks', [])[-8:])
+            recent_checks = list(bot_status.get('recent_checks', [])[-10:])
+        
+        # Coin colors mapping
+        coin_colors = {
+            'BTC': '#f7931a',
+            'ETH': '#627eea', 
+            'SOL': '#9945ff',
+            'XRP': '#23292f'
+        }
         
         recent_html = ''
         for i, check in enumerate(reversed(recent_checks)):
             total = check.get('total', 1.02)
             if total < 1.00:
-                badge_class, badge_text = 'badge-green', 'ARB'
+                badge_class, badge_text = 'badge-arb', 'ARB!'
             elif total < 1.01:
-                badge_class, badge_text = 'badge-yellow', 'CLOSE'
+                badge_class, badge_text = 'badge-close', 'CLOSE'
             elif total <= 1.02:
-                badge_class, badge_text = 'badge-blue', 'OK'
+                badge_class, badge_text = 'badge-ok', 'OK'
             else:
-                badge_class, badge_text = 'badge-gray', '-'
+                badge_class, badge_text = 'badge-wait', 'WAIT'
             
-            coin = 'BTC' if 'Bitcoin' in check.get('q', '') else 'ETH' if 'Ethereum' in check.get('q', '') else 'SOL' if 'Solana' in check.get('q', '') else 'XRP'
-            # Added HTML escape for safety
-            safe_q = html.escape(check.get('q', 'Unknown')[:30])
+            q = check.get('q', 'Unknown')
+            coin = 'BTC' if 'Bitcoin' in q else 'ETH' if 'Ethereum' in q else 'SOL' if 'Solana' in q else 'XRP'
+            coin_color = coin_colors.get(coin, '#64748b')
+            safe_q = html.escape(q[:35])
+            
+            # Extract timeframe from question
+            timeframe = '15m' if '15' in q else '1H' if 'AM ET' in q or 'PM ET' in q else '4H' if 'AM-' in q or 'PM-' in q else 'D'
             
             recent_html += f'''
-            <div class="check-row" style="animation-delay: {i * 0.05}s">
-                <div class="check-left">
-                    <span class="coin-badge">{coin}</span>
-                    <span class="check-name">{safe_q}</span>
+            <div class="market-card" style="animation-delay: {i * 0.05}s">
+                <div class="market-header">
+                    <span class="coin-badge" style="background: {coin_color}20; color: {coin_color}; border: 1px solid {coin_color}40">{coin}</span>
+                    <span class="timeframe-badge">{timeframe}</span>
                 </div>
-                <div class="check-right">
-                    <span class="check-spread">{total:.4f}</span>
+                <div class="market-title">{safe_q}</div>
+                <div class="market-footer">
+                    <div class="spread-info">
+                        <span class="spread-label">Spread</span>
+                        <span class="spread-value">{total:.4f}</span>
+                    </div>
                     <span class="{badge_class}">{badge_text}</span>
                 </div>
             </div>'''
+        
+        # Determine status indicator
+        status_color = '#10b981' if markets_count > 0 else '#f59e0b'
+        status_text = 'LIVE' if markets_count > 0 else 'CONNECTING...'
         
         return f'''<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Polymarket Bot</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>Polymarket Arbitrage Bot</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ font-family: 'Inter', sans-serif; background: #0a0a0f; color: #fff; min-height: 100vh; }}
-        .container {{ max-width: 900px; margin: 0 auto; padding: 24px; }}
-        .header {{ text-align: center; padding: 40px 0 30px; }}
-        .status-badge {{ display: inline-flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); padding: 8px 16px; border-radius: 100px; font-size: 13px; color: #10b981; }}
-        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 30px 0; }}
-        .stat {{ background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 24px; text-align: center; }}
-        .stat-value {{ font-size: 28px; font-weight: 700; margin-bottom: 4px; }}
-        .stat-label {{ font-size: 13px; color: #64748b; font-weight: 500; }}
-        .card {{ background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 24px; margin-bottom: 20px; }}
-        .check-row {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }}
-        .badge-green {{ background: rgba(16, 185, 129, 0.15); color: #10b981; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        .badge-blue {{ background: rgba(59, 130, 246, 0.15); color: #3b82f6; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        .badge-gray {{ background: rgba(100, 116, 139, 0.15); color: #64748b; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        .badge-yellow {{ background: rgba(234, 179, 8, 0.15); color: #eab308; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        
+        :root {{
+            --bg-primary: #0a0a0f;
+            --bg-card: rgba(255,255,255,0.03);
+            --bg-card-hover: rgba(255,255,255,0.06);
+            --border-color: rgba(255,255,255,0.08);
+            --text-primary: #ffffff;
+            --text-secondary: #94a3b8;
+            --accent-green: #10b981;
+            --accent-yellow: #f59e0b;
+            --accent-blue: #3b82f6;
+            --accent-red: #ef4444;
+        }}
+        
+        body {{
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-primary);
+            background-image: radial-gradient(ellipse at top, #1a1a2e 0%, var(--bg-primary) 50%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            overflow-x: hidden;
+        }}
+        
+        .container {{
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 16px;
+            padding-bottom: 80px;
+        }}
+        
+        /* Header */
+        .header {{
+            text-align: center;
+            padding: 24px 0 20px;
+        }}
+        
+        .logo {{
+            font-size: 28px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 12px;
+        }}
+        
+        .status-pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: {status_color}15;
+            border: 1px solid {status_color}40;
+            padding: 8px 16px;
+            border-radius: 50px;
+            font-size: 12px;
+            font-weight: 600;
+            color: {status_color};
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        .status-dot {{
+            width: 8px;
+            height: 8px;
+            background: {status_color};
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }}
+        
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; transform: scale(1); }}
+            50% {{ opacity: 0.5; transform: scale(0.8); }}
+        }}
+        
+        /* Stats Grid */
+        .stats-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin: 20px 0;
+        }}
+        
+        .stat-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 16px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
+        }}
+        
+        .stat-card:hover {{
+            background: var(--bg-card-hover);
+            transform: translateY(-2px);
+        }}
+        
+        .stat-icon {{
+            font-size: 20px;
+            margin-bottom: 8px;
+        }}
+        
+        .stat-value {{
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 4px;
+            color: var(--text-primary);
+        }}
+        
+        .stat-value.green {{ color: var(--accent-green); }}
+        .stat-value.blue {{ color: var(--accent-blue); }}
+        .stat-value.yellow {{ color: var(--accent-yellow); }}
+        
+        .stat-label {{
+            font-size: 11px;
+            color: var(--text-secondary);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        /* Section */
+        .section {{
+            margin: 24px 0;
+        }}
+        
+        .section-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }}
+        
+        .section-title {{
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }}
+        
+        .section-badge {{
+            font-size: 11px;
+            color: var(--text-secondary);
+            background: var(--bg-card);
+            padding: 4px 10px;
+            border-radius: 20px;
+        }}
+        
+        /* Market Cards */
+        .markets-grid {{
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }}
+        
+        .market-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 14px;
+            padding: 14px;
+            animation: fadeInUp 0.4s ease forwards;
+            opacity: 0;
+            transform: translateY(10px);
+        }}
+        
+        @keyframes fadeInUp {{
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+        
+        .market-header {{
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+        }}
+        
+        .coin-badge {{
+            font-size: 11px;
+            font-weight: 700;
+            padding: 4px 8px;
+            border-radius: 6px;
+        }}
+        
+        .timeframe-badge {{
+            font-size: 10px;
+            font-weight: 600;
+            padding: 4px 8px;
+            border-radius: 6px;
+            background: rgba(100,116,139,0.15);
+            color: #94a3b8;
+        }}
+        
+        .market-title {{
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+            line-height: 1.4;
+        }}
+        
+        .market-footer {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .spread-info {{
+            display: flex;
+            flex-direction: column;
+        }}
+        
+        .spread-label {{
+            font-size: 10px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+        }}
+        
+        .spread-value {{
+            font-size: 16px;
+            font-weight: 700;
+            font-family: 'SF Mono', 'Monaco', monospace;
+        }}
+        
+        /* Badges */
+        .badge-arb {{
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 700;
+            animation: glow 1.5s infinite alternate;
+        }}
+        
+        @keyframes glow {{
+            from {{ box-shadow: 0 0 5px #10b98150; }}
+            to {{ box-shadow: 0 0 20px #10b98180; }}
+        }}
+        
+        .badge-close {{
+            background: rgba(245, 158, 11, 0.15);
+            color: #f59e0b;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        
+        .badge-ok {{
+            background: rgba(59, 130, 246, 0.15);
+            color: #3b82f6;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        
+        .badge-wait {{
+            background: rgba(100, 116, 139, 0.15);
+            color: #64748b;
+            padding: 6px 12px;
+            border-radius: 8px;
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        
+        /* Footer */
+        .footer {{
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(to top, var(--bg-primary) 60%, transparent);
+            padding: 20px;
+            text-align: center;
+        }}
+        
+        .footer-text {{
+            font-size: 11px;
+            color: var(--text-secondary);
+        }}
+        
+        .refresh-indicator {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 8px;
+            font-size: 10px;
+            color: var(--accent-green);
+        }}
+        
+        .refresh-dot {{
+            width: 6px;
+            height: 6px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: blink 1s infinite;
+        }}
+        
+        @keyframes blink {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: 0.3; }}
+        }}
+        
+        /* Empty State */
+        .empty-state {{
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+        }}
+        
+        .empty-icon {{
+            font-size: 40px;
+            margin-bottom: 12px;
+            opacity: 0.5;
+        }}
+        
+        /* Responsive */
+        @media (min-width: 480px) {{
+            .stats-grid {{ grid-template-columns: repeat(4, 1fr); }}
+            .stat-value {{ font-size: 28px; }}
+            .logo {{ font-size: 32px; }}
+        }}
     </style>
-    <script>setTimeout(() => location.reload(), 10000);</script>
+    <script>
+        setTimeout(() => location.reload(), 5000);
+    </script>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>Polymarket Live Bot</h1>
-            <div class="status-badge">● Running 24/7 on Cloud</div>
+            <div class="logo">Poly Arb Bot</div>
+            <div class="status-pill">
+                <span class="status-dot"></span>
+                {status_text}
+            </div>
         </div>
-        <div class="stats">
-            <div class="stat"><div class="stat-value">${balance:.2f}</div><div class="stat-label">Wallet Est.</div></div>
-            <div class="stat"><div class="stat-value">{total_trades}</div><div class="stat-label">Live Trades</div></div>
-            <div class="stat"><div class="stat-value">{markets_count}</div><div class="stat-label">Mkts Scanned</div></div>
-            <div class="stat"><div class="stat-value">{best_spread:.4f}</div><div class="stat-label">Best Spread</div></div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-icon">💰</div>
+                <div class="stat-value green">${balance:.2f}</div>
+                <div class="stat-label">Balance</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">📈</div>
+                <div class="stat-value blue">{total_trades}</div>
+                <div class="stat-label">Trades</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">🎯</div>
+                <div class="stat-value">{markets_count}</div>
+                <div class="stat-label">Markets</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">⚡</div>
+                <div class="stat-value yellow">{best_spread:.3f}</div>
+                <div class="stat-label">Best Spread</div>
+            </div>
         </div>
-        <div class="card">
-            <h3>Live Market Checks</h3>
-            {recent_html if recent_html else '<p style="color:#64748b;text-align:center;">Scanning markets...</p>'}
+        
+        <div class="section">
+            <div class="section-header">
+                <span class="section-title">Live Market Scans</span>
+                <span class="section-badge">{checks} checks</span>
+            </div>
+            <div class="markets-grid">
+                {recent_html if recent_html else '<div class="empty-state"><div class="empty-icon">🔍</div><div>Scanning markets...</div></div>'}
+            </div>
         </div>
-        <div class="footer">Auto-refreshes every 10s • Checks: {checks} • Last: {last_update}</div>
+    </div>
+    
+    <div class="footer">
+        <div class="footer-text">Last update: {last_update or 'Starting...'}</div>
+        <div class="refresh-indicator">
+            <span class="refresh-dot"></span>
+            Auto-refresh in 5s
+        </div>
     </div>
 </body>
 </html>'''
@@ -323,11 +725,11 @@ class ArbitrageBot:
             bot_status['total_trades'] = self.real_client.total_trades
 
     def scan_markets(self):
-        """Scan all enabled timeframes for crypto Up/Down markets."""
+        """Scan all enabled timeframes for LIVE crypto Up/Down markets only."""
         try:
             found = []
             
-            logger.info("🔄 Scanning multi-timeframe crypto markets...")
+            logger.info("🔄 Scanning LIVE crypto markets (4 per timeframe)...")
             
             for timeframe, config in TIMEFRAME_CONFIG.items():
                 # Skip disabled timeframes
@@ -351,21 +753,25 @@ class ArbitrageBot:
                     else:
                         events = data
                     
-                    tf_count = 0
+                    # Collect all live markets by coin, then pick soonest ending for each
+                    coin_markets = {'BTC': [], 'ETH': [], 'SOL': [], 'XRP': []}
                     
                     for event in events:
                         title = event.get('title', '')
                         slug = event.get('slug', '')
                         
-                        # Check if it's a crypto event
-                        is_crypto = any(coin in (title + slug).lower() for coin in COINS)
-                        if not is_crypto:
+                        coin = detect_coin(title + ' ' + slug)
+                        if not coin:
                             continue
                         
                         # Extract markets from event
                         markets = event.get('markets', [])
                         
                         for m in markets:
+                            # Skip non-live markets
+                            if not is_market_live(m, event):
+                                continue
+                            
                             # Parse tokens
                             try:
                                 tokens = m.get('clobTokenIds', [])
@@ -381,10 +787,22 @@ class ArbitrageBot:
                             m['_tokens'] = tokens
                             m['_timeframe'] = timeframe
                             m['_event_slug'] = slug
-                            found.append(m)
+                            m['_coin'] = coin
+                            m['_end_date'] = m.get('endDate') or m.get('end_date_iso') or ''
+                            
+                            coin_markets[coin].append(m)
+                    
+                    # Select only 1 market per coin (soonest ending)
+                    tf_count = 0
+                    for coin in ['BTC', 'ETH', 'SOL', 'XRP']:
+                        if coin_markets[coin]:
+                            # Sort by end date and take first (soonest)
+                            coin_markets[coin].sort(key=lambda x: x['_end_date'])
+                            live_market = coin_markets[coin][0]
+                            found.append(live_market)
                             tf_count += 1
                     
-                    logger.info(f"  {timeframe}: {tf_count} markets")
+                    logger.info(f"  {timeframe}: {tf_count} LIVE markets")
                     
                 except Exception as e:
                     logger.error(f"  {timeframe}: Error - {e}")
@@ -397,7 +815,7 @@ class ArbitrageBot:
             with status_lock:
                 bot_status['markets_count'] = len(found)
             
-            logger.info(f"🔍 Total: {len(found)} crypto Up/Down markets across all timeframes")
+            logger.info(f"🔍 Total: {len(found)} LIVE markets (expected: 16)")
             
         except Exception as e:
             logger.error(f"Scan error: {e}")
