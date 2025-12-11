@@ -20,9 +20,12 @@ TAG_15M = 102467
 WEB_PORT = int(os.environ.get('PORT', 8080))
 
 # JSONbin.io Configuration (set as environment variables on Railway)
-JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', 'YOUR_X_MASTER_KEY_HERE')
-JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', 'YOUR_BIN_ID_HERE')
-JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
+JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
+JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}" if JSONBIN_BIN_ID else None
+
+# Check if JSONbin is properly configured
+JSONBIN_CONFIGURED = bool(JSONBIN_API_KEY and JSONBIN_BIN_ID and 'YOUR_' not in JSONBIN_API_KEY and 'YOUR_' not in JSONBIN_BIN_ID)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -50,11 +53,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     
     def do_GET(self):
         if self.path == '/api/status':
+            # Thread-safe read for API endpoint
+            with status_lock:
+                payload = json.dumps(bot_status)
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(bot_status).encode('utf-8'))
+            self.wfile.write(payload.encode('utf-8'))
         else:
             self.send_response(200)
             self.send_header('Content-type', 'text/html; charset=utf-8')
@@ -236,6 +242,9 @@ class CloudPersistentClient:
 
     def _load_from_cloud(self):
         """Load state from JSONbin.io"""
+        if not JSONBIN_CONFIGURED:
+            logger.info("JSONbin not configured; using local initial balance.")
+            return
         try:
             headers = {
                 'X-Master-Key': JSONBIN_API_KEY,
@@ -244,9 +253,9 @@ class CloudPersistentClient:
             resp = requests.get(JSONBIN_URL, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                record = data.get('record', {})
-                self.balance = record.get('balance', self.balance)
-                self.total_trades = record.get('total_trades', 0)
+                record = data.get('record', {}) if isinstance(data, dict) else {}
+                self.balance = float(record.get('balance', self.balance))
+                self.total_trades = int(record.get('total_trades', 0))
                 logger.info(f"☁️ Loaded from cloud: Balance=${self.balance:.2f}, Trades={self.total_trades}")
             else:
                 logger.warning(f"Could not load from JSONbin: {resp.status_code}")
@@ -255,6 +264,8 @@ class CloudPersistentClient:
 
     def _save_to_cloud(self):
         """Save state to JSONbin.io"""
+        if not JSONBIN_CONFIGURED:
+            return
         try:
             headers = {
                 'X-Master-Key': JSONBIN_API_KEY,
@@ -266,10 +277,10 @@ class CloudPersistentClient:
                 'last_updated': datetime.now().isoformat()
             }
             resp = requests.put(JSONBIN_URL, headers=headers, json=data, timeout=10)
-            if resp.status_code == 200:
+            if 200 <= resp.status_code < 300:
                 logger.info(f"☁️ Saved to cloud: Balance=${self.balance:.2f}")
             else:
-                logger.warning(f"Cloud save failed: {resp.status_code}")
+                logger.warning(f"Cloud save failed: {resp.status_code} {resp.text[:100]}")
         except Exception as e:
             logger.warning(f"Cloud save error: {e}")
 
@@ -282,6 +293,24 @@ class CloudPersistentClient:
             self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
         self.positions[market_id][outcome] += size_shares
         logger.info(f"⚡ BOUGHT {size_shares:.2f} {outcome} @ ${price:.3f}")
+        return True
+
+    def execute_pair_buy(self, market_id, up_price, down_price, shares):
+        """
+        Atomically buy both UP and DOWN if sufficient balance.
+        Prevents inconsistent state from partial execution.
+        """
+        total_cost = (up_price * shares) + (down_price * shares)
+        if total_cost > self.balance:
+            logger.warning(f"Insufficient balance for pair buy. Need ${total_cost:.2f}, have ${self.balance:.2f}")
+            return False
+        # Atomic execution
+        self.balance -= total_cost
+        if market_id not in self.positions:
+            self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
+        self.positions[market_id]['UP'] += shares
+        self.positions[market_id]['DOWN'] += shares
+        logger.info(f"⚡ PAIR BUY: {shares:.2f} shares @ UP:{up_price:.3f} + DOWN:{down_price:.3f} = ${total_cost:.2f}")
         return True
 
     def merge_and_settle(self, market_id):
@@ -330,7 +359,8 @@ class ArbitrageBot:
                         found.append(m)
                 self.target_markets = found
                 self.last_scan_time = time.time()
-                bot_status['markets_count'] = len(found)
+                with status_lock:
+                    bot_status['markets_count'] = len(found)
                 logger.info(f"🔍 Scanned: {len(found)} markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
@@ -348,15 +378,14 @@ class ArbitrageBot:
                 if ask_up is None or ask_down is None:
                     continue
 
-                bot_status['checks'] += 1
                 total = ask_up + ask_down
+                q = market.get('question', '')[:35]
                 
-                # Thread-safe updates
+                # Thread-safe updates - all bot_status writes inside lock
                 with status_lock:
+                    bot_status['checks'] += 1
                     if total < bot_status['best_spread']:
                         bot_status['best_spread'] = total
-                    
-                    q = market.get('question', '')[:35]
                     bot_status['recent_checks'].append({'q': q, 'up': ask_up, 'down': ask_down, 'total': total})
                     if len(bot_status['recent_checks']) > 10:
                         bot_status['recent_checks'].pop(0)
@@ -364,12 +393,24 @@ class ArbitrageBot:
                 if total < MIN_SPREAD_TARGET:
                     profit = 1.00 - total
                     if profit >= PROFIT_THRESHOLD:
-                        logger.info(f"🎯 ARBITRAGE! {q} | Spread: {total:.4f}")
+                        # Guard: skip if prices are invalid
+                        if ask_up <= 0 or ask_down <= 0:
+                            logger.warning("Invalid ask price (<= 0); skipping market")
+                            continue
+                        
+                        # BET_SIZE = total budget for the pair buy
                         shares = round(BET_SIZE / total, 2)
+                        
+                        # Guard: skip if shares round to zero
+                        if shares <= 0:
+                            continue
+                        
+                        logger.info(f"🎯 ARBITRAGE! {q} | Spread: {total:.4f} | Profit: ${profit * shares:.4f}")
+                        
                         cid = market.get('conditionId')
-                        if self.mock_client.buy(cid, 'UP', ask_up, shares):
-                            if self.mock_client.buy(cid, 'DOWN', ask_down, shares):
-                                self.mock_client.merge_and_settle(cid)
+                        # Use atomic pair buy to prevent partial execution
+                        if self.mock_client.execute_pair_buy(cid, ask_up, ask_down, shares):
+                            self.mock_client.merge_and_settle(cid)
 
             except Exception as e:
                 if "429" in str(e):
@@ -386,9 +427,10 @@ class ArbitrageBot:
         return None
 
     def update_status(self):
-        bot_status['balance'] = self.mock_client.balance
-        bot_status['total_trades'] = self.mock_client.total_trades
-        bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
+        with status_lock:
+            bot_status['balance'] = self.mock_client.balance
+            bot_status['total_trades'] = self.mock_client.total_trades
+            bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
 
     def run(self):
         logger.info("🚀 Starting Polymarket Bot with Cloud Persistence")
