@@ -257,12 +257,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 class CloudPersistentClient:
-    """Paper Trading Client with JSONbin.io cloud persistence."""
+    """
+    Paper Trading Client with JSONbin.io cloud persistence.
+    Includes 'Safe Sync' to prevent overwriting data if load fails.
+    """
     
     def __init__(self, initial_balance=1000.0):
         self.balance = initial_balance
         self.positions = {}
         self.total_trades = 0
+        self.is_synced = False  # SAFETY FLAG: Default to False
+        self.lock = threading.Lock()  # Thread safety for balance operations
         self._load_from_cloud()
 
     def _load_from_cloud(self):
@@ -270,32 +275,54 @@ class CloudPersistentClient:
         if not JSONBIN_CONFIGURED:
             logger.info("JSONbin not configured; using local initial balance.")
             return
+
         try:
             headers = {
                 'X-Master-Key': JSONBIN_API_KEY,
                 'X-Bin-Meta': 'false'
             }
+            logger.info(f"☁️ Connecting to JSONBin...")
             resp = requests.get(JSONBIN_URL, headers=headers, timeout=10)
+            
             if resp.status_code == 200:
                 data = resp.json()
-                record = data.get('record', {}) if isinstance(data, dict) else {}
+                # JSONBin V3 returns data inside 'record' usually, but sometimes direct
+                record = data.get('record', data) if isinstance(data, dict) else {}
+                
+                # Update state
                 self.balance = float(record.get('balance', self.balance))
                 self.total_trades = int(record.get('total_trades', 0))
-                logger.info(f"☁️ Loaded from cloud: Balance=${self.balance:.2f}, Trades={self.total_trades}")
+                
+                # SAFETY: Mark as successfully synced. We can now save later.
+                self.is_synced = True 
+                logger.info(f"✅ Loaded from cloud: Balance=${self.balance:.2f}, Trades={self.total_trades}")
             else:
-                logger.warning(f"Could not load from JSONbin: {resp.status_code}")
+                # CRITICAL: If we can't read, we MUST NOT write later.
+                self.is_synced = False
+                logger.error(f"❌ Load Failed (Status {resp.status_code}). Cloud Save DISABLED to protect data.")
+                logger.error(f"Response: {resp.text}")
+                
         except Exception as e:
-            logger.warning(f"Cloud load error: {e}")
+            self.is_synced = False
+            logger.error(f"❌ Cloud Connection Error: {e}. Cloud Save DISABLED.")
 
     def _save_to_cloud(self):
         """Save state to JSONbin.io"""
         if not JSONBIN_CONFIGURED:
             return
+
+        # SAFETY CHECK: Do not overwrite cloud if we never loaded correctly
+        if not self.is_synced:
+            logger.warning("⚠️ SKIPPING SAVE: Cannot overwrite cloud because initial load failed.")
+            return
+
         try:
             headers = {
                 'X-Master-Key': JSONBIN_API_KEY,
-                'Content-Type': 'application/json'
+                'Content-Type': 'application/json',
+                'X-Bin-Versioning': 'false'  # Prevent creating 1000s of versions
             }
+            
             data = {
                 'balance': self.balance,
                 'total_trades': self.total_trades,
@@ -303,7 +330,9 @@ class CloudPersistentClient:
                 'best_spread': bot_status.get('best_spread', 1.02),
                 'last_updated': datetime.now().isoformat()
             }
+            
             resp = requests.put(JSONBIN_URL, headers=headers, json=data, timeout=10)
+            
             if 200 <= resp.status_code < 300:
                 logger.info(f"☁️ Saved to cloud: Balance=${self.balance:.2f}")
             else:
@@ -312,46 +341,52 @@ class CloudPersistentClient:
             logger.warning(f"Cloud save error: {e}")
 
     def buy(self, market_id, outcome, price, size_shares):
-        cost = price * size_shares
-        if cost > self.balance:
-            return False
-        self.balance -= cost
-        if market_id not in self.positions:
-            self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
-        self.positions[market_id][outcome] += size_shares
-        logger.info(f"⚡ BOUGHT {size_shares:.2f} {outcome} @ ${price:.3f}")
-        return True
+        with self.lock:
+            cost = price * size_shares
+            if cost > self.balance:
+                return False
+            self.balance -= cost
+            if market_id not in self.positions:
+                self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
+            self.positions[market_id][outcome] += size_shares
+            logger.info(f"⚡ BOUGHT {size_shares:.2f} {outcome} @ ${price:.3f}")
+            return True
 
     def execute_pair_buy(self, market_id, up_price, down_price, shares):
         """
         Atomically buy both UP and DOWN if sufficient balance.
         Prevents inconsistent state from partial execution.
         """
-        total_cost = (up_price * shares) + (down_price * shares)
-        if total_cost > self.balance:
-            logger.warning(f"Insufficient balance for pair buy. Need ${total_cost:.2f}, have ${self.balance:.2f}")
-            return False
-        # Atomic execution
-        self.balance -= total_cost
-        if market_id not in self.positions:
-            self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
-        self.positions[market_id]['UP'] += shares
-        self.positions[market_id]['DOWN'] += shares
-        logger.info(f"⚡ PAIR BUY: {shares:.2f} shares @ UP:{up_price:.3f} + DOWN:{down_price:.3f} = ${total_cost:.2f}")
-        return True
+        with self.lock:
+            total_cost = (up_price * shares) + (down_price * shares)
+            if total_cost > self.balance:
+                logger.warning(f"Insufficient balance for pair buy. Need ${total_cost:.2f}, have ${self.balance:.2f}")
+                return False
+            # Atomic execution
+            self.balance -= total_cost
+            if market_id not in self.positions:
+                self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
+            self.positions[market_id]['UP'] += shares
+            self.positions[market_id]['DOWN'] += shares
+            logger.info(f"⚡ PAIR BUY: {shares:.2f} shares @ UP:{up_price:.3f} + DOWN:{down_price:.3f} = ${total_cost:.2f}")
+            return True
 
     def merge_and_settle(self, market_id):
-        if market_id not in self.positions:
-            return
-        pos = self.positions[market_id]
-        mergeable = min(pos.get('UP', 0), pos.get('DOWN', 0))
-        if mergeable > 0:
-            pos['UP'] -= mergeable
-            pos['DOWN'] -= mergeable
-            self.balance += mergeable * 1.00
-            self.total_trades += 1
-            logger.info(f"💎 SETTLED | Balance: ${self.balance:.2f}")
-            self._save_to_cloud()  # Save after each trade!
+        with self.lock:
+            if market_id not in self.positions:
+                return
+            pos = self.positions[market_id]
+            mergeable = min(pos.get('UP', 0), pos.get('DOWN', 0))
+            
+            if mergeable > 0:
+                pos['UP'] -= mergeable
+                pos['DOWN'] -= mergeable
+                self.balance += mergeable * 1.00
+                self.total_trades += 1
+                logger.info(f"💎 SETTLED | Balance: ${self.balance:.2f}")
+                
+        # Save OUTSIDE the lock to keep lock time short
+        self._save_to_cloud()
 
 
 class ArbitrageBot:
