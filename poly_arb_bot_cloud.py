@@ -173,6 +173,12 @@ class RealMoneyClient:
         self.chain_id = 137 # Hardcoded to Polygon Mainnet (Safer)
         self.total_trades = 0
         self.balance = 0.0
+        self.client = None  # Initialize to None first
+        
+        # Log env var status for debugging
+        logger.info(f"🔑 PRIVATE_KEY set: {bool(self.key)}")
+        logger.info(f"🔑 FUNDER_ADDRESS set: {bool(os.environ.get('FUNDER_ADDRESS'))}")
+        logger.info(f"🔑 POLY_API_KEY set: {bool(os.environ.get('POLY_API_KEY'))}")
         
         try:
             self.client = ClobClient(
@@ -188,6 +194,7 @@ class RealMoneyClient:
             logger.info("✅ Connected to Polymarket CLOB Client (Real Money)")
         except Exception as e:
             logger.error(f"❌ Failed to connect to CLOB: {e}")
+            self.client = None  # Ensure it's None on failure
         
         self.update_balance()
 
@@ -196,6 +203,11 @@ class RealMoneyClient:
         self.balance = 100.0 
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares):
+        # Safety: Skip if client failed to initialize
+        if self.client is None:
+            logger.error("❌ Cannot trade: CLOB Client not connected. Check your env vars!")
+            return False
+            
         token_yes = tokens[0]
         token_no = tokens[1]
         try:
