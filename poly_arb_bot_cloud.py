@@ -6,7 +6,7 @@ import logging
 import threading
 import concurrent.futures
 import html  # Added for dashboard security
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
@@ -443,6 +443,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             color: var(--text-secondary);
             margin-bottom: 10px;
             line-height: 1.4;
+            word-break: break-word;
         }}
         
         .market-footer {{
@@ -1297,7 +1298,9 @@ class ArbitrageBot:
         with status_lock:
             bot_status['balance'] = self.real_client.balance
             bot_status['total_trades'] = self.real_client.total_trades
-            bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
+            # Use IST timezone (UTC+5:30)
+            ist = timezone(timedelta(hours=5, minutes=30))
+            bot_status['last_update'] = datetime.now(ist).strftime('%H:%M:%S')
 
     def run(self):
         logger.info("🚀 Starting LIVE Polymarket Bot (Real Money)")
