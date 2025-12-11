@@ -14,7 +14,7 @@ from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
-MIN_SPREAD_TARGET = 1.02      # ⚠️ TESTING MODE: Set to 1.02 to trigger trades (CHANGE BACK TO 0.98!)
+MIN_SPREAD_TARGET = 1.0       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
 BET_SIZE = 5.0                # Live Risk: $5.00 per trade
 PROFIT_THRESHOLD = 0.001
@@ -187,7 +187,7 @@ class RealMoneyClient:
                 self.host,
                 key=self.key,
                 chain_id=self.chain_id,
-                signature_type=1,  # 1 for email/Magic wallet (Polymarket managed)
+                signature_type=0,  # 0 for EOA/MetaMask wallets
                 funder=self.funder
             )
             
