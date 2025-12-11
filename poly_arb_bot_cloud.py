@@ -213,17 +213,23 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
+            # Round to API precision limits (per GitHub issue #121)
+            # For tick_size=0.01: price=2 decimals, size=2 decimals
+            up_price_rounded = round(up_price, 2)
+            down_price_rounded = round(down_price, 2)
+            shares_rounded = round(shares, 2)
+            
             # Create orders using OrderArgs (official method)
             order_args_yes = OrderArgs(
                 token_id=token_yes,
-                price=up_price,
-                size=shares,
+                price=up_price_rounded,
+                size=shares_rounded,
                 side=BUY
             )
             order_args_no = OrderArgs(
                 token_id=token_no,
-                price=down_price,
-                size=shares,
+                price=down_price_rounded,
+                size=shares_rounded,
                 side=BUY
             )
             
