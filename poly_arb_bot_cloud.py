@@ -20,7 +20,7 @@ BET_SIZE = 2.0                # Reduced for better fills on both sides
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
-TAG_UP_OR_DOWN = 102127         # "Up or Down" tag (contains all timeframe markets)
+TAG_15M = 102467                # 15-min Crypto Up/Down markets (WORKING TAG!)
 CRYPTO_KEYWORDS = ['bitcoin', 'solana', 'ethereum', 'xrp']  # Filter for crypto only
 WEB_PORT = int(os.environ.get('PORT', 8080))
 
@@ -281,14 +281,13 @@ class ArbitrageBot:
 
     def scan_markets(self):
         try:
-            # Fetch from "Up or Down" tag which contains all crypto timeframe markets
+            # Fetch ALL active markets (no tag filter) - filter client-side for crypto
             resp = requests.get(
                 f"{GAMMA_API_URL}/markets",
                 params={
                     'active': 'true',
                     'closed': 'false',
-                    'tag_id': TAG_UP_OR_DOWN,
-                    'limit': 200
+                    'limit': 500  # Fetch more to find all crypto markets
                 },
                 timeout=15
             )
