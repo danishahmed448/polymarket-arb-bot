@@ -10,11 +10,17 @@ from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
-from py_clob_client.order_builder.constants import BUY
+from py_clob_client.order_builder.constants import BUY, SELL
+
+# Merge function imports
+from web3 import Web3
+from eth_account import Account
+from abi.ctf_abi import ctf_abi
+from abi.safe_abi import safe_abi
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
-MIN_SPREAD_TARGET = 1.0       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
+MIN_SPREAD_TARGET = 0.98       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
 BET_SIZE = 5.0                # Must be at least $5 to meet minimum 5 share requirement
 MIN_SHARES = 5.0              # Polymarket minimum order size
@@ -22,6 +28,13 @@ PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 WEB_PORT = int(os.environ.get('PORT', 8080))
+
+# --- Merge Function Constants (Polygon Mainnet) ---
+CONDITIONAL_TOKENS_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045'
+NEG_RISK_ADAPTER_ADDRESS = '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296'
+USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
+USDCE_DIGITS = 6
+RPC_URL = os.environ.get('RPC_URL', 'https://polygon-rpc.com/')
 
 # --- Multi-Timeframe Configuration ---
 # Discovered from Polymarket API (Chrome Network Tab)
@@ -697,6 +710,45 @@ class RealMoneyClient:
                 logger.info(f"Spread {total_spread:.4f} >= 0.98, not profitable enough, skipping")
                 return False
             
+            # PRE-TRADE LIQUIDITY CHECK: Ensure we can exit if needed
+            # Check bid-side liquidity on BOTH tokens before entering
+            try:
+                ob_yes = self.client.get_order_book(token_yes)
+                ob_no = self.client.get_order_book(token_no)
+                
+                def get_bid_liquidity(ob):
+                    """Get total bid-side liquidity value in USD."""
+                    bids = []
+                    if hasattr(ob, 'bids') and ob.bids:
+                        bids = ob.bids
+                    elif isinstance(ob, dict) and ob.get('bids'):
+                        bids = ob['bids']
+                    
+                    total_liquidity = 0
+                    for bid in bids:
+                        price = float(bid.price) if hasattr(bid, 'price') else float(bid['price'])
+                        size = float(bid.size) if hasattr(bid, 'size') else float(bid['size'])
+                        total_liquidity += price * size
+                    return total_liquidity
+                
+                yes_bid_liquidity = get_bid_liquidity(ob_yes)
+                no_bid_liquidity = get_bid_liquidity(ob_no)
+                
+                min_exit_liquidity = BET_SIZE * 0.5  # Need at least 50% of bet size in bids to exit
+                
+                if yes_bid_liquidity < min_exit_liquidity:
+                    logger.warning(f"⚠️ Insufficient YES bid liquidity (${yes_bid_liquidity:.2f}), skipping trade")
+                    return False
+                
+                if no_bid_liquidity < min_exit_liquidity:
+                    logger.warning(f"⚠️ Insufficient NO bid liquidity (${no_bid_liquidity:.2f}), skipping trade")
+                    return False
+                    
+                logger.info(f"✅ Liquidity check passed: YES bids ${yes_bid_liquidity:.2f}, NO bids ${no_bid_liquidity:.2f}")
+                
+            except Exception as liq_e:
+                logger.warning(f"⚠️ Liquidity check failed: {liq_e}, proceeding with caution")
+            
             # Target exactly MIN_SHARES on each side
             target_shares = MIN_SHARES  # 5 shares
             
@@ -755,10 +807,34 @@ class RealMoneyClient:
             
             if not no_success:
                 error_msg = resp_no.get("error", "Unknown error") if isinstance(resp_no, dict) else str(resp_no)
-                logger.error(f"⚠️ NO order not filled but YES was! UNHEDGED POSITION!")
-                logger.error(f"   This shouldn't happen often with FOK. Error: {error_msg}")
-                # YES already filled, we have an unhedged position
-                # Log it prominently but can't undo the YES fill
+                logger.error(f"⚠️ NO order not filled but YES was! ATTEMPTING EMERGENCY EXIT...")
+                logger.error(f"   Original error: {error_msg}")
+                
+                # EMERGENCY EXIT: Try to sell the YES position immediately
+                try:
+                    # Create a market SELL order for YES to exit position
+                    exit_order = MarketOrderArgs(
+                        token_id=token_yes,
+                        amount=cash_for_yes,  # Sell back approximately what we bought
+                        side=SELL
+                    )
+                    signed_exit = self.client.create_market_order(exit_order)
+                    resp_exit = self.client.post_order(signed_exit, OrderType.FOK)
+                    
+                    exit_success = resp_exit.get("success", False) if isinstance(resp_exit, dict) else False
+                    
+                    if exit_success:
+                        logger.info(f"🆘 EMERGENCY EXIT SUCCESSFUL! Sold YES position to minimize loss")
+                    else:
+                        exit_error = resp_exit.get("error", "Unknown") if isinstance(resp_exit, dict) else str(resp_exit)
+                        logger.error(f"❌ EMERGENCY EXIT FAILED! You have an unhedged YES position!")
+                        logger.error(f"   Exit error: {exit_error}")
+                        logger.error(f"   Token: {token_yes}")
+                        logger.error(f"   ACTION REQUIRED: Manually sell on Polymarket website!")
+                except Exception as exit_e:
+                    logger.error(f"❌ EMERGENCY EXIT EXCEPTION: {exit_e}")
+                    logger.error(f"   You have an unhedged YES position on token: {token_yes}")
+                
                 return False
 
             # BOTH orders succeeded!
@@ -778,9 +854,149 @@ class RealMoneyClient:
             logger.error(traceback.format_exc())
             return False
 
-    def merge_and_settle(self, condition_id):
-        logger.info("💰 Arbed! (Manual Merge Required on Website)")
-        pass
+    def merge_and_settle(self, condition_id, amount=None, neg_risk=False):
+        """
+        Merge conditional tokens back to USDC.
+        
+        Args:
+            condition_id: The condition ID (bytes32 hex string)
+            amount: Amount to merge in USDC (e.g., "1.5"). If None, merges all available tokens
+            neg_risk: Whether to use NEG_RISK_ADAPTER (default: False)
+        
+        Returns:
+            bool: True if merge successful, False otherwise
+        """
+        try:
+            # Check if env vars are set
+            proxy_wallet = os.environ.get("FUNDER_ADDRESS")  # Polymarket profile address
+            private_key = os.environ.get("PRIVATE_KEY")
+            
+            if not proxy_wallet or not private_key:
+                logger.info("💰 Arbed! (Manual Merge - PROXY_WALLET not configured)")
+                return False
+            
+            # Connect to Polygon
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
+            
+            # Inject POA middleware for Polygon
+            from web3.middleware import ExtraDataToPOAMiddleware
+            w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
+            
+            # Load wallet and safe
+            account = Account.from_key(private_key)
+            safe_address = Web3.to_checksum_address(proxy_wallet)
+            
+            safe = w3.eth.contract(address=safe_address, abi=safe_abi)
+            
+            # Determine merge amount
+            if amount is None:
+                # Get minimum balance of both positions
+                ctf_contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(CONDITIONAL_TOKENS_ADDRESS),
+                    abi=ctf_abi
+                )
+                
+                parent_collection_id = bytes(32)
+                collection_id_0 = ctf_contract.functions.getCollectionId(
+                    parent_collection_id, bytes.fromhex(condition_id[2:] if condition_id.startswith('0x') else condition_id), 1
+                ).call()
+                collection_id_1 = ctf_contract.functions.getCollectionId(
+                    parent_collection_id, bytes.fromhex(condition_id[2:] if condition_id.startswith('0x') else condition_id), 2
+                ).call()
+                
+                position_id_0 = ctf_contract.functions.getPositionId(
+                    Web3.to_checksum_address(USDC_ADDRESS), collection_id_0
+                ).call()
+                position_id_1 = ctf_contract.functions.getPositionId(
+                    Web3.to_checksum_address(USDC_ADDRESS), collection_id_1
+                ).call()
+                
+                balance_0 = ctf_contract.functions.balanceOf(safe_address, position_id_0).call()
+                balance_1 = ctf_contract.functions.balanceOf(safe_address, position_id_1).call()
+                
+                amount_wei = min(balance_0, balance_1)
+                
+                if amount_wei == 0:
+                    logger.warning("Merge failed: No tokens to merge")
+                    return False
+            else:
+                amount_wei = int(float(amount) * (10 ** USDCE_DIGITS))
+            
+            # Encode merge transaction
+            ctf_contract = w3.eth.contract(abi=ctf_abi)
+            parent_collection_id = '0x0000000000000000000000000000000000000000000000000000000000000000'
+            partition = [1, 2]
+            
+            cond_id_bytes = condition_id[2:] if condition_id.startswith('0x') else condition_id
+            
+            data = ctf_contract.functions.mergePositions(
+                Web3.to_checksum_address(USDC_ADDRESS),
+                bytes.fromhex(parent_collection_id[2:]),
+                bytes.fromhex(cond_id_bytes),
+                partition,
+                amount_wei
+            )._encode_transaction_data()
+            
+            # Sign and execute Safe transaction
+            nonce = safe.functions.nonce().call()
+            to = NEG_RISK_ADAPTER_ADDRESS if neg_risk else CONDITIONAL_TOKENS_ADDRESS
+            
+            tx_hash = safe.functions.getTransactionHash(
+                Web3.to_checksum_address(to),
+                0,
+                bytes.fromhex(data[2:]),
+                0,  # operation: Call
+                0, 0, 0,  # safeTxGas, baseGas, gasPrice
+                '0x0000000000000000000000000000000000000000',  # gasToken
+                '0x0000000000000000000000000000000000000000',  # refundReceiver
+                nonce
+            ).call()
+            
+            # Sign the hash
+            hash_bytes = Web3.to_bytes(hexstr=tx_hash.hex() if hasattr(tx_hash, 'hex') else tx_hash)
+            signature_obj = account.unsafe_sign_hash(hash_bytes)
+            
+            r = signature_obj.r.to_bytes(32, byteorder='big')
+            s = signature_obj.s.to_bytes(32, byteorder='big')
+            v = signature_obj.v.to_bytes(1, byteorder='big')
+            signature = r + s + v
+            
+            # Build and send transaction
+            tx = safe.functions.execTransaction(
+                Web3.to_checksum_address(to),
+                0,
+                bytes.fromhex(data[2:]),
+                0,
+                0, 0, 0,
+                '0x0000000000000000000000000000000000000000',
+                '0x0000000000000000000000000000000000000000',
+                signature
+            ).build_transaction({
+                'from': account.address,
+                'nonce': w3.eth.get_transaction_count(account.address),
+                'gas': 500000,
+                'gasPrice': w3.eth.gas_price,
+            })
+            
+            signed_tx = account.sign_transaction(tx)
+            tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
+            
+            # Wait for receipt
+            receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+            
+            # Check if transaction succeeded
+            if receipt['status'] == 1:
+                logger.info(f"💰 Merge successful! Amount: {amount_wei / 10**USDCE_DIGITS} USDC")
+                return True
+            else:
+                logger.error("Merge failed: Transaction reverted")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Merge failed: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
 class ArbitrageBot:
     def __init__(self):
