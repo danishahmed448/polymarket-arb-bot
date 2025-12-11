@@ -5,15 +5,17 @@ import requests
 import logging
 import threading
 import concurrent.futures
+import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
+from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
-INITIAL_BALANCE = 1000.0
-MIN_SPREAD_TARGET = 1.00
-POLL_INTERVAL = 1.0           # Faster polling (was 2.0)
-BET_SIZE = 10.0               # Total budget for pair buy
+INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
+MIN_SPREAD_TARGET = 0.98      # Target 2% spread (Covers fees/slippage)
+POLL_INTERVAL = 1.0           # Fast polling
+BET_SIZE = 5.0                # Live Risk: $5.00 per trade
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -23,15 +25,6 @@ WEB_PORT = int(os.environ.get('PORT', 8080))
 # Speed Optimization Settings
 MAX_WORKERS = 10              # Parallel order book fetches
 MAX_REQUESTS_PER_SECOND = 8   # Rate limit to avoid 429s
-PRIORITY_SPREAD_THRESHOLD = 1.02  # Prioritize markets with tight spreads
-
-# JSONbin.io Configuration (set as environment variables on Railway)
-JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
-JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', '')
-JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}" if JSONBIN_BIN_ID else None
-
-# Check if JSONbin is properly configured
-JSONBIN_CONFIGURED = bool(JSONBIN_API_KEY and JSONBIN_BIN_ID and 'YOUR_' not in JSONBIN_API_KEY and 'YOUR_' not in JSONBIN_BIN_ID)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -41,8 +34,7 @@ status_lock = threading.Lock()
 
 # Global state for web dashboard
 bot_status = {
-    'balance': INITIAL_BALANCE,
-    'initial_balance': INITIAL_BALANCE,
+    'balance': 0.0,
     'total_trades': 0,
     'markets_count': 0,
     'best_spread': 1.02,
@@ -51,7 +43,6 @@ bot_status = {
     'recent_checks': [],
     'running': True
 }
-
 
 class RateLimiter:
     """Thread-safe rate limiter to avoid API 429 errors."""
@@ -71,14 +62,12 @@ class RateLimiter:
 # Global rate limiter for CLOB API
 clob_rate_limiter = RateLimiter(max_per_second=MAX_REQUESTS_PER_SECOND)
 
-
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
     
     def do_GET(self):
         if self.path == '/api/status':
-            # Thread-safe read for API endpoint
             with status_lock:
                 payload = json.dumps(bot_status)
             self.send_response(200)
@@ -93,21 +82,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(self.get_dashboard_html().encode('utf-8'))
     
     def get_dashboard_html(self):
-        # Thread-safe read of shared state
         with status_lock:
             balance = bot_status['balance']
-            initial_balance = bot_status['initial_balance']
             total_trades = bot_status['total_trades']
             markets_count = bot_status['markets_count']
             best_spread = bot_status['best_spread']
             checks = bot_status['checks']
             last_update = bot_status['last_update']
             recent_checks = list(bot_status.get('recent_checks', [])[-8:])
-        
-        profit = balance - initial_balance
-        profit_pct = (profit / initial_balance) * 100 if initial_balance > 0 else 0
-        profit_color = '#10b981' if profit >= 0 else '#ef4444'
-        profit_icon = 'trending_up' if profit >= 0 else 'trending_down'
         
         recent_html = ''
         for i, check in enumerate(reversed(recent_checks)):
@@ -122,11 +104,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 badge_class, badge_text = 'badge-gray', '-'
             
             coin = 'BTC' if 'Bitcoin' in check.get('q', '') else 'ETH' if 'Ethereum' in check.get('q', '') else 'SOL' if 'Solana' in check.get('q', '') else 'XRP'
+            # Added HTML escape for safety
+            safe_q = html.escape(check.get('q', 'Unknown')[:30])
+            
             recent_html += f'''
             <div class="check-row" style="animation-delay: {i * 0.05}s">
                 <div class="check-left">
                     <span class="coin-badge">{coin}</span>
-                    <span class="check-name">{check.get('q', 'Unknown')[:30]}</span>
+                    <span class="check-name">{safe_q}</span>
                 </div>
                 <div class="check-right">
                     <span class="check-spread">{total:.4f}</span>
@@ -141,284 +126,149 @@ class DashboardHandler(BaseHTTPRequestHandler):
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Polymarket Bot</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{ 
-            font-family: 'Inter', -apple-system, sans-serif;
-            background: #0a0a0f;
-            color: #fff;
-            min-height: 100vh;
-        }}
-        .bg-gradient {{
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: radial-gradient(ellipse at top, #1a1a3e 0%, #0a0a0f 50%),
-                        radial-gradient(ellipse at bottom right, #0f172a 0%, transparent 50%);
-            z-index: -1;
-        }}
+        body {{ font-family: 'Inter', sans-serif; background: #0a0a0f; color: #fff; min-height: 100vh; }}
         .container {{ max-width: 900px; margin: 0 auto; padding: 24px; }}
-        
-        /* Header */
         .header {{ text-align: center; padding: 40px 0 30px; }}
-        .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, #fff 0%, #94a3b8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
         .status-badge {{ display: inline-flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); padding: 8px 16px; border-radius: 100px; font-size: 13px; color: #10b981; }}
-        .pulse {{ width: 8px; height: 8px; background: #10b981; border-radius: 50%; animation: pulse 2s infinite; }}
-        @keyframes pulse {{ 0%, 100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.5; transform: scale(0.9); }} }}
-        
-        /* Stats Grid */
         .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 30px 0; }}
-        @media (max-width: 600px) {{ .stats {{ grid-template-columns: repeat(2, 1fr); }} }}
-        .stat {{ background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 24px; text-align: center; transition: all 0.3s; }}
-        .stat:hover {{ background: rgba(255,255,255,0.05); transform: translateY(-2px); }}
-        .stat-icon {{ width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; margin: 0 auto 12px; }}
-        .stat-icon .material-icons-round {{ font-size: 22px; }}
+        .stat {{ background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 24px; text-align: center; }}
         .stat-value {{ font-size: 28px; font-weight: 700; margin-bottom: 4px; }}
         .stat-label {{ font-size: 13px; color: #64748b; font-weight: 500; }}
-        
-        /* Card */
-        .card {{ background: rgba(255,255,255,0.02); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 24px; margin-bottom: 20px; }}
-        .card-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }}
-        .card-header h2 {{ font-size: 16px; font-weight: 600; color: #e2e8f0; }}
-        .card-header .material-icons-round {{ font-size: 20px; color: #64748b; }}
-        
-        /* Check Rows */
-        .check-row {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); animation: fadeIn 0.3s ease; }}
-        .check-row:last-child {{ border-bottom: none; }}
-        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateX(-10px); }} to {{ opacity: 1; transform: translateX(0); }} }}
-        .check-left {{ display: flex; align-items: center; gap: 12px; }}
-        .check-right {{ display: flex; align-items: center; gap: 12px; }}
-        .coin-badge {{ background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%); padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        .check-name {{ color: #94a3b8; font-size: 14px; }}
-        .check-spread {{ font-family: 'SF Mono', monospace; font-size: 15px; font-weight: 600; }}
-        
-        /* Badges */
+        .card {{ background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 24px; margin-bottom: 20px; }}
+        .check-row {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); }}
         .badge-green {{ background: rgba(16, 185, 129, 0.15); color: #10b981; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        .badge-yellow {{ background: rgba(234, 179, 8, 0.15); color: #eab308; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
         .badge-blue {{ background: rgba(59, 130, 246, 0.15); color: #3b82f6; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
         .badge-gray {{ background: rgba(100, 116, 139, 0.15); color: #64748b; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
-        
-        /* Footer */
-        .footer {{ text-align: center; padding: 30px; color: #475569; font-size: 13px; }}
-        .footer a {{ color: #3b82f6; text-decoration: none; }}
+        .badge-yellow {{ background: rgba(234, 179, 8, 0.15); color: #eab308; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
     </style>
     <script>setTimeout(() => location.reload(), 10000);</script>
 </head>
 <body>
-    <div class="bg-gradient"></div>
     <div class="container">
         <div class="header">
-            <h1>Polymarket Arbitrage Bot</h1>
-            <div class="status-badge"><span class="pulse"></span> Running 24/7 on Cloud</div>
+            <h1>Polymarket Live Bot</h1>
+            <div class="status-badge">● Running 24/7 on Cloud</div>
         </div>
-        
         <div class="stats">
-            <div class="stat">
-                <div class="stat-icon" style="background: rgba(16, 185, 129, 0.15);"><span class="material-icons-round" style="color: #10b981;">account_balance_wallet</span></div>
-                <div class="stat-value" style="color: #10b981;">${balance:.2f}</div>
-                <div class="stat-label">Balance</div>
-            </div>
-            <div class="stat">
-                <div class="stat-icon" style="background: rgba({('16, 185, 129' if profit >= 0 else '239, 68, 68')}, 0.15);"><span class="material-icons-round" style="color: {profit_color};">{profit_icon}</span></div>
-                <div class="stat-value" style="color: {profit_color};">${profit:+.2f}</div>
-                <div class="stat-label">Profit ({profit_pct:+.1f}%)</div>
-            </div>
-            <div class="stat">
-                <div class="stat-icon" style="background: rgba(139, 92, 246, 0.15);"><span class="material-icons-round" style="color: #8b5cf6;">swap_horiz</span></div>
-                <div class="stat-value">{total_trades}</div>
-                <div class="stat-label">Trades</div>
-            </div>
-            <div class="stat">
-                <div class="stat-icon" style="background: rgba(59, 130, 246, 0.15);"><span class="material-icons-round" style="color: #3b82f6;">speed</span></div>
-                <div class="stat-value">{best_spread:.4f}</div>
-                <div class="stat-label">Best Spread</div>
-            </div>
+            <div class="stat"><div class="stat-value">${balance:.2f}</div><div class="stat-label">Wallet Est.</div></div>
+            <div class="stat"><div class="stat-value">{total_trades}</div><div class="stat-label">Live Trades</div></div>
+            <div class="stat"><div class="stat-value">{markets_count}</div><div class="stat-label">Mkts Scanned</div></div>
+            <div class="stat"><div class="stat-value">{best_spread:.4f}</div><div class="stat-label">Best Spread</div></div>
         </div>
-        
         <div class="card">
-            <div class="card-header"><span class="material-icons-round">monitoring</span><h2>Live Market Checks</h2></div>
-            {recent_html if recent_html else '<p style="color:#64748b;text-align:center;padding:20px;">Waiting for market data...</p>'}
+            <h3>Live Market Checks</h3>
+            {recent_html if recent_html else '<p style="color:#64748b;text-align:center;">Scanning markets...</p>'}
         </div>
-        
-        <div class="card">
-            <div class="card-header"><span class="material-icons-round">info</span><h2>Bot Statistics</h2></div>
-            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;text-align:center;">
-                <div><div style="font-size:24px;font-weight:600;">{markets_count}</div><div style="color:#64748b;font-size:13px;">Markets</div></div>
-                <div><div style="font-size:24px;font-weight:600;">{checks}</div><div style="color:#64748b;font-size:13px;">Total Checks</div></div>
-                <div><div style="font-size:24px;font-weight:600;">{last_update}</div><div style="color:#64748b;font-size:13px;">Last Update</div></div>
-            </div>
-        </div>
-        
-        <div class="footer">Auto-refreshes every 10 seconds &bull; <a href="/api/status">View API</a></div>
+        <div class="footer">Auto-refreshes every 10s • Checks: {checks} • Last: {last_update}</div>
     </div>
 </body>
 </html>'''
 
-
-
-class CloudPersistentClient:
-    """
-    Paper Trading Client with JSONbin.io cloud persistence.
-    Includes 'Safe Sync' to prevent overwriting data if load fails.
-    """
-    
-    def __init__(self, initial_balance=1000.0):
-        self.balance = initial_balance
-        self.positions = {}
+class RealMoneyClient:
+    def __init__(self):
+        self.host = "https://clob.polymarket.com"
+        self.key = os.environ.get("PRIVATE_KEY") 
+        self.chain_id = 137 # Hardcoded to Polygon Mainnet (Safer)
         self.total_trades = 0
-        self.is_synced = False  # SAFETY FLAG: Default to False
-        self.lock = threading.Lock()  # Thread safety for balance operations
-        self._load_from_cloud()
-
-    def _load_from_cloud(self):
-        """Load state from JSONbin.io"""
-        if not JSONBIN_CONFIGURED:
-            logger.info("JSONbin not configured; using local initial balance.")
-            return
-
+        self.balance = 0.0
+        
         try:
-            headers = {
-                'X-Master-Key': JSONBIN_API_KEY,
-                'X-Bin-Meta': 'false'
-            }
-            logger.info(f"☁️ Connecting to JSONBin...")
-            resp = requests.get(JSONBIN_URL, headers=headers, timeout=10)
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                # JSONBin V3 returns data inside 'record' usually, but sometimes direct
-                record = data.get('record', data) if isinstance(data, dict) else {}
-                
-                # Update state
-                self.balance = float(record.get('balance', self.balance))
-                self.total_trades = int(record.get('total_trades', 0))
-                
-                # SAFETY: Mark as successfully synced. We can now save later.
-                self.is_synced = True 
-                logger.info(f"✅ Loaded from cloud: Balance=${self.balance:.2f}, Trades={self.total_trades}")
-            else:
-                # CRITICAL: If we can't read, we MUST NOT write later.
-                self.is_synced = False
-                logger.error(f"❌ Load Failed (Status {resp.status_code}). Cloud Save DISABLED to protect data.")
-                logger.error(f"Response: {resp.text}")
-                
+            self.client = ClobClient(
+                self.host,
+                key=self.key,
+                chain_id=self.chain_id,
+                signature_type=2, 
+                funder=os.environ.get("FUNDER_ADDRESS"), 
+                api_key=os.environ.get("POLY_API_KEY"),
+                api_secret=os.environ.get("POLY_API_SECRET"),
+                api_passphrase=os.environ.get("POLY_API_PASSPHRASE")
+            )
+            logger.info("✅ Connected to Polymarket CLOB Client (Real Money)")
         except Exception as e:
-            self.is_synced = False
-            logger.error(f"❌ Cloud Connection Error: {e}. Cloud Save DISABLED.")
+            logger.error(f"❌ Failed to connect to CLOB: {e}")
+        
+        self.update_balance()
 
-    def _save_to_cloud(self):
-        """Save state to JSONbin.io"""
-        if not JSONBIN_CONFIGURED:
-            return
+    def update_balance(self):
+        # We assume $100 for dashboard purposes to save API calls
+        self.balance = 100.0 
 
-        # SAFETY CHECK: Do not overwrite cloud if we never loaded correctly
-        if not self.is_synced:
-            logger.warning("⚠️ SKIPPING SAVE: Cannot overwrite cloud because initial load failed.")
-            return
-
+    def execute_pair_buy(self, tokens, up_price, down_price, shares):
+        token_yes = tokens[0]
+        token_no = tokens[1]
         try:
-            headers = {
-                'X-Master-Key': JSONBIN_API_KEY,
-                'Content-Type': 'application/json',
-                'X-Bin-Versioning': 'false'  # Prevent creating 1000s of versions
-            }
-            
-            data = {
-                'balance': self.balance,
-                'total_trades': self.total_trades,
-                'total_checks': bot_status.get('checks', 0),
-                'best_spread': bot_status.get('best_spread', 1.02),
-                'last_updated': datetime.now().isoformat()
-            }
-            
-            resp = requests.put(JSONBIN_URL, headers=headers, json=data, timeout=10)
-            
-            if 200 <= resp.status_code < 300:
-                logger.info(f"☁️ Saved to cloud: Balance=${self.balance:.2f}")
-            else:
-                logger.warning(f"Cloud save failed: {resp.status_code} {resp.text[:100]}")
-        except Exception as e:
-            logger.warning(f"Cloud save error: {e}")
+            # 1. Buy YES shares (FOK)
+            order_yes = self.client.create_order(
+                token_id=token_yes, price=up_price, size=shares, side=BUY, order_type="FOK"
+            )
+            # 2. Buy NO shares (FOK)
+            order_no = self.client.create_order(
+                token_id=token_no, price=down_price, size=shares, side=BUY, order_type="FOK"
+            )
 
-    def buy(self, market_id, outcome, price, size_shares):
-        with self.lock:
-            cost = price * size_shares
-            if cost > self.balance:
-                return False
-            self.balance -= cost
-            if market_id not in self.positions:
-                self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
-            self.positions[market_id][outcome] += size_shares
-            logger.info(f"⚡ BOUGHT {size_shares:.2f} {outcome} @ ${price:.3f}")
-            return True
-
-    def execute_pair_buy(self, market_id, up_price, down_price, shares):
-        """
-        Atomically buy both UP and DOWN if sufficient balance.
-        Prevents inconsistent state from partial execution.
-        """
-        with self.lock:
-            total_cost = (up_price * shares) + (down_price * shares)
-            if total_cost > self.balance:
-                logger.warning(f"Insufficient balance for pair buy. Need ${total_cost:.2f}, have ${self.balance:.2f}")
-                return False
-            # Atomic execution
-            self.balance -= total_cost
-            if market_id not in self.positions:
-                self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
-            self.positions[market_id]['UP'] += shares
-            self.positions[market_id]['DOWN'] += shares
-            logger.info(f"⚡ PAIR BUY: {shares:.2f} shares @ UP:{up_price:.3f} + DOWN:{down_price:.3f} = ${total_cost:.2f}")
-            return True
-
-    def merge_and_settle(self, market_id):
-        with self.lock:
-            if market_id not in self.positions:
-                return
-            pos = self.positions[market_id]
-            mergeable = min(pos.get('UP', 0), pos.get('DOWN', 0))
+            # Post orders
+            resp_yes = self.client.post_order(order_yes)
+            resp_no = self.client.post_order(order_no)
             
-            if mergeable > 0:
-                pos['UP'] -= mergeable
-                pos['DOWN'] -= mergeable
-                self.balance += mergeable * 1.00
+            yes_success = resp_yes.get("success", False)
+            no_success = resp_no.get("success", False)
+
+            if yes_success and no_success:
+                logger.info(f"✅ REAL TRADE EXECUTED: Bought {shares} shares.")
                 self.total_trades += 1
-                logger.info(f"💎 SETTLED | Balance: ${self.balance:.2f}")
-                
-        # Save OUTSIDE the lock to keep lock time short
-        self._save_to_cloud()
+                return True
+            else:
+                logger.error(f"❌ Trade Failed/Partial. Yes:{yes_success} No:{no_success}")
+                logger.error(f"Resp YES: {resp_yes}")
+                logger.error(f"Resp NO: {resp_no}")
+                return False
+        except Exception as e:
+            logger.error(f"Real Trade Exception: {e}")
+            return False
 
+    def merge_and_settle(self, condition_id):
+        logger.info("💰 Arbed! (Manual Merge Required on Website)")
+        pass
 
 class ArbitrageBot:
     def __init__(self):
         self.clob_client = ClobClient(host=CLOB_HOST, key=None, chain_id=137)
-        self.mock_client = CloudPersistentClient(initial_balance=INITIAL_BALANCE)
+        self.real_client = RealMoneyClient()
         self.target_markets = []
         self.last_scan_time = 0
-        self.last_cloud_save = 0
         
-        # Sync dashboard with cloud data immediately
         with status_lock:
-            bot_status['balance'] = self.mock_client.balance
-            bot_status['total_trades'] = self.mock_client.total_trades
+            bot_status['balance'] = self.real_client.balance
+            bot_status['total_trades'] = self.real_client.total_trades
 
     def scan_markets(self):
         try:
             resp = requests.get(f"{GAMMA_API_URL}/markets", params={'active': 'true', 'closed': 'false', 'tag_id': TAG_15M, 'limit': 50}, timeout=15)
             if resp.status_code == 200:
-                markets = resp.json()
+                data = resp.json()
+                # Safety check for list format
+                if isinstance(data, list):
+                    markets = data
+                elif isinstance(data, dict) and 'markets' in data:
+                    markets = data['markets']
+                else:
+                    return
+
                 found = []
                 for m in markets:
-                    if m.get('closed') or not m.get('active', True):
-                        continue
-                    clob_ids_str = m.get('clobTokenIds', '[]')
+                    if m.get('closed') or not m.get('active', True): continue
+                    
                     try:
+                        clob_ids_str = m.get('clobTokenIds', '[]')
                         clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                    except:
-                        clob_ids = []
+                    except: clob_ids = []
+                    
                     if clob_ids and len(clob_ids) >= 2:
                         m['_tokens'] = clob_ids
                         found.append(m)
+                
                 self.target_markets = found
                 self.last_scan_time = time.time()
                 with status_lock:
@@ -428,66 +278,40 @@ class ArbitrageBot:
             logger.error(f"Scan error: {e}")
 
     def check_for_arbitrage(self):
-        """
-        PRO VERSION: Parallel order book fetching for 10x speed improvement.
-        Uses ThreadPoolExecutor to check multiple markets simultaneously.
-        """
-        # Sort markets by last known spread (prioritize tight spreads)
-        sorted_markets = sorted(
-            self.target_markets,
-            key=lambda m: m.get('_last_spread', 1.02)
-        )
+        sorted_markets = sorted(self.target_markets, key=lambda m: m.get('_last_spread', 1.02))
         
         def process_single_market(market):
-            """Worker function to check a single market (runs in parallel)."""
             try:
                 tokens = market.get('_tokens', [])
-                if len(tokens) < 2:
-                    return None
+                if len(tokens) < 2: return None
 
-                # Optimization: Sequential calls inside parallel worker
-                # (Inner ThreadPool was overhead; outer loop provides parallelism)
-                
-                # Rate limit (minimal wait, don't block other threads excessively)
+                # Fetch both sides
                 clob_rate_limiter.wait()
                 ob_up = self.clob_client.get_order_book(tokens[0])
-                
                 clob_rate_limiter.wait()
                 ob_down = self.clob_client.get_order_book(tokens[1])
 
                 ask_up = self._get_best_ask(ob_up)
                 ask_down = self._get_best_ask(ob_down)
 
-                if ask_up is None or ask_down is None:
-                    return None
+                if ask_up is None or ask_down is None: return None
 
                 total = ask_up + ask_down
                 q = market.get('question', '')[:35]
-                market['_last_spread'] = total  # Update for prioritization
-                
+                market['_last_spread'] = total
                 return {'q': q, 'up': ask_up, 'down': ask_down, 'total': total, 'market': market}
-
-            except Exception as e:
-                # Filter out noisy 429s as we handle them gracefully
-                if "429" not in str(e):
-                    logger.debug(f"Market check error: {e}")
+            except Exception:
                 return None
 
-        # Run ALL market checks in PARALLEL
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {executor.submit(process_single_market, m): m for m in sorted_markets}
-            
             for future in concurrent.futures.as_completed(futures):
                 res = future.result()
-                if res:
-                    results.append(res)
+                if res: results.append(res)
         
-        # Process results (trading logic)
         for res in results:
             total = res['total']
-            
-            # Update Dashboard Stats (Thread-Safe)
             with status_lock:
                 bot_status['checks'] += 1
                 if total < bot_status['best_spread']:
@@ -496,93 +320,81 @@ class ArbitrageBot:
                 if len(bot_status['recent_checks']) > 10:
                     bot_status['recent_checks'].pop(0)
 
-            # Execute arbitrage if profitable
+            # REAL TRADE EXECUTION
             if total < MIN_SPREAD_TARGET:
                 profit = 1.00 - total
                 if profit >= PROFIT_THRESHOLD:
-                    if res['up'] <= 0 or res['down'] <= 0:
-                        continue
+                    if res['up'] <= 0 or res['down'] <= 0: continue
                     
                     shares = round(BET_SIZE / total, 2)
-                    if shares <= 0:
-                        continue
+                    if shares <= 0: continue
 
                     logger.info(f"🎯 ARBITRAGE! {res['q']} | Spread: {total:.4f} | Profit: ${profit * shares:.4f}")
                     
                     cid = res['market'].get('conditionId')
-                    if self.mock_client.execute_pair_buy(cid, res['up'], res['down'], shares):
-                        self.mock_client.merge_and_settle(cid)
-
+                    tokens = res['market'].get('_tokens')
+                    
+                    # Execute
+                    if self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares):
+                        self.real_client.merge_and_settle(cid)
 
     def _get_best_ask(self, ob):
-        """
-        PRO VERSION: Calculates Weighted Average Price (VWAP) 
-        to ensure we can actually buy BET_SIZE amount.
-        Checks if there is enough liquidity to fill the order.
-        """
         try:
+            # Safety Check: Handle None or missing data
+            if not ob: return None
+            
             asks = []
             if hasattr(ob, 'asks') and ob.asks:
-                asks = ob.asks # Object format
+                asks = ob.asks
             elif isinstance(ob, dict) and ob.get('asks'):
-                asks = ob['asks'] # Dict format
+                asks = ob['asks']
             else:
                 return None
+            
+            if len(asks) == 0: return None
 
-            # Sort by price ascending (cheapest first)
             parse_price = lambda x: float(x.price) if hasattr(x, 'price') else float(x['price'])
             parse_size = lambda x: float(x.size) if hasattr(x, 'size') else float(x['size'])
             
-            # Filter out zero or negative prices/sizes just in case
             valid_asks = [a for a in asks if parse_price(a) > 0 and parse_size(a) > 0]
             valid_asks.sort(key=parse_price)
 
-            needed_cash = BET_SIZE / 2 # We buy roughly half on each side (simplified)
+            needed_cash = BET_SIZE / 2
             total_shares = 0
             total_cost = 0
             
             for ask in valid_asks:
                 price = parse_price(ask)
                 size = parse_size(ask)
-                
-                # How much cash is available at this price level?
                 liquidity_value = price * size
                 
                 if total_cost + liquidity_value >= needed_cash:
-                    # We have enough liquidity here to fill the rest
                     remaining_cash = needed_cash - total_cost
                     shares_to_buy = remaining_cash / price
-                    
                     total_shares += shares_to_buy
                     total_cost += remaining_cash
                     break
                 else:
-                    # Take all liquidity at this level
                     total_shares += size
                     total_cost += liquidity_value
 
-            if total_cost < needed_cash * 0.9: # Check if we found at least 90% of needed liquidity
-                return None # Not enough liquidity to trade safely
-
-            # Calculate Average Entry Price
+            if total_cost < needed_cash * 0.9: return None
             if total_shares == 0: return None
-            avg_price = total_cost / total_shares
-            return avg_price
+            
+            return total_cost / total_shares
 
-        except Exception as e:
-            logger.debug(f"Order book parse error: {e}")
-        return None
+        except Exception:
+            return None
 
     def update_status(self):
         with status_lock:
-            bot_status['balance'] = self.mock_client.balance
-            bot_status['total_trades'] = self.mock_client.total_trades
+            bot_status['balance'] = self.real_client.balance
+            bot_status['total_trades'] = self.real_client.total_trades
             bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
 
     def run(self):
-        logger.info("🚀 Starting Polymarket Bot with Cloud Persistence")
+        logger.info("🚀 Starting LIVE Polymarket Bot (Real Money)")
         logger.info(f"📊 Dashboard: http://localhost:{WEB_PORT}")
-        logger.info(f"☁️ State: JSONbin.io")
         
         server = HTTPServer(('0.0.0.0', WEB_PORT), DashboardHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -594,22 +406,15 @@ class ArbitrageBot:
                 if time.time() - self.last_scan_time > 60:
                     self.scan_markets()
                 
-                # Periodic cloud save every 5 minutes
-                if time.time() - self.last_cloud_save > 300:
-                    self.mock_client._save_to_cloud()
-                    self.last_cloud_save = time.time()
-                
                 self.check_for_arbitrage()
                 self.update_status()
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
                 logger.info("🛑 Stopping...")
-                self.mock_client._save_to_cloud()
                 break
             except Exception as e:
                 logger.error(f"Error: {e}")
                 time.sleep(5)
-
 
 if __name__ == "__main__":
     bot = ArbitrageBot()
