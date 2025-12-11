@@ -27,6 +27,9 @@ JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
+# Thread lock for safe access to shared state
+status_lock = threading.Lock()
+
 # Global state for web dashboard
 bot_status = {
     'balance': INITIAL_BALANCE,
@@ -59,13 +62,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(self.get_dashboard_html().encode('utf-8'))
     
     def get_dashboard_html(self):
-        profit = bot_status['balance'] - bot_status['initial_balance']
-        profit_pct = (profit / bot_status['initial_balance']) * 100 if bot_status['initial_balance'] > 0 else 0
+        # Thread-safe read of shared state
+        with status_lock:
+            balance = bot_status['balance']
+            initial_balance = bot_status['initial_balance']
+            total_trades = bot_status['total_trades']
+            markets_count = bot_status['markets_count']
+            best_spread = bot_status['best_spread']
+            checks = bot_status['checks']
+            last_update = bot_status['last_update']
+            recent_checks = list(bot_status.get('recent_checks', [])[-8:])
+        
+        profit = balance - initial_balance
+        profit_pct = (profit / initial_balance) * 100 if initial_balance > 0 else 0
         profit_color = '#10b981' if profit >= 0 else '#ef4444'
         profit_icon = 'trending_up' if profit >= 0 else 'trending_down'
         
         recent_html = ''
-        for i, check in enumerate(reversed(bot_status.get('recent_checks', [])[-8:])):
+        for i, check in enumerate(reversed(recent_checks)):
             total = check.get('total', 1.02)
             if total < 1.00:
                 badge_class, badge_text = 'badge-green', 'ARB'
@@ -170,7 +184,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <div class="stats">
             <div class="stat">
                 <div class="stat-icon" style="background: rgba(16, 185, 129, 0.15);"><span class="material-icons-round" style="color: #10b981;">account_balance_wallet</span></div>
-                <div class="stat-value" style="color: #10b981;">${bot_status['balance']:.2f}</div>
+                <div class="stat-value" style="color: #10b981;">${balance:.2f}</div>
                 <div class="stat-label">Balance</div>
             </div>
             <div class="stat">
@@ -180,12 +194,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
             </div>
             <div class="stat">
                 <div class="stat-icon" style="background: rgba(139, 92, 246, 0.15);"><span class="material-icons-round" style="color: #8b5cf6;">swap_horiz</span></div>
-                <div class="stat-value">{bot_status['total_trades']}</div>
+                <div class="stat-value">{total_trades}</div>
                 <div class="stat-label">Trades</div>
             </div>
             <div class="stat">
                 <div class="stat-icon" style="background: rgba(59, 130, 246, 0.15);"><span class="material-icons-round" style="color: #3b82f6;">speed</span></div>
-                <div class="stat-value">{bot_status['best_spread']:.4f}</div>
+                <div class="stat-value">{best_spread:.4f}</div>
                 <div class="stat-label">Best Spread</div>
             </div>
         </div>
@@ -198,9 +212,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         <div class="card">
             <div class="card-header"><span class="material-icons-round">info</span><h2>Bot Statistics</h2></div>
             <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;text-align:center;">
-                <div><div style="font-size:24px;font-weight:600;">{bot_status['markets_count']}</div><div style="color:#64748b;font-size:13px;">Markets</div></div>
-                <div><div style="font-size:24px;font-weight:600;">{bot_status['checks']}</div><div style="color:#64748b;font-size:13px;">Total Checks</div></div>
-                <div><div style="font-size:24px;font-weight:600;">{bot_status['last_update']}</div><div style="color:#64748b;font-size:13px;">Last Update</div></div>
+                <div><div style="font-size:24px;font-weight:600;">{markets_count}</div><div style="color:#64748b;font-size:13px;">Markets</div></div>
+                <div><div style="font-size:24px;font-weight:600;">{checks}</div><div style="color:#64748b;font-size:13px;">Total Checks</div></div>
+                <div><div style="font-size:24px;font-weight:600;">{last_update}</div><div style="color:#64748b;font-size:13px;">Last Update</div></div>
             </div>
         </div>
         
@@ -223,7 +237,10 @@ class CloudPersistentClient:
     def _load_from_cloud(self):
         """Load state from JSONbin.io"""
         try:
-            headers = {'X-Master-Key': JSONBIN_API_KEY}
+            headers = {
+                'X-Master-Key': JSONBIN_API_KEY,
+                'X-Bin-Meta': 'false'
+            }
             resp = requests.get(JSONBIN_URL, headers=headers, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
@@ -288,6 +305,11 @@ class ArbitrageBot:
         self.target_markets = []
         self.last_scan_time = 0
         self.last_cloud_save = 0
+        
+        # Sync dashboard with cloud data immediately
+        with status_lock:
+            bot_status['balance'] = self.mock_client.balance
+            bot_status['total_trades'] = self.mock_client.total_trades
 
     def scan_markets(self):
         try:
@@ -329,13 +351,15 @@ class ArbitrageBot:
                 bot_status['checks'] += 1
                 total = ask_up + ask_down
                 
-                if total < bot_status['best_spread']:
-                    bot_status['best_spread'] = total
-                
-                q = market.get('question', '')[:35]
-                bot_status['recent_checks'].append({'q': q, 'up': ask_up, 'down': ask_down, 'total': total})
-                if len(bot_status['recent_checks']) > 10:
-                    bot_status['recent_checks'].pop(0)
+                # Thread-safe updates
+                with status_lock:
+                    if total < bot_status['best_spread']:
+                        bot_status['best_spread'] = total
+                    
+                    q = market.get('question', '')[:35]
+                    bot_status['recent_checks'].append({'q': q, 'up': ask_up, 'down': ask_down, 'total': total})
+                    if len(bot_status['recent_checks']) > 10:
+                        bot_status['recent_checks'].pop(0)
 
                 if total < MIN_SPREAD_TARGET:
                     profit = 1.00 - total
