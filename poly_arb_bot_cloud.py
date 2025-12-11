@@ -195,7 +195,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             'BTC': '#f7931a',
             'ETH': '#627eea', 
             'SOL': '#9945ff',
-            'XRP': '#23292f'
+            'XRP': '#ffffff'
         }
         
         recent_html = ''
@@ -213,7 +213,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             q = check.get('q', 'Unknown')
             coin = 'BTC' if 'Bitcoin' in q else 'ETH' if 'Ethereum' in q else 'SOL' if 'Solana' in q else 'XRP'
             coin_color = coin_colors.get(coin, '#64748b')
-            safe_q = html.escape(q[:35])
+            safe_q = html.escape(q)
             
             # Extract timeframe from question
             timeframe = '15m' if '15' in q else '1H' if 'AM ET' in q or 'PM ET' in q else '4H' if 'AM-' in q or 'PM-' in q else 'D'
