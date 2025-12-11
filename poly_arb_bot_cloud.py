@@ -9,7 +9,7 @@ import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
 from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
@@ -652,15 +652,15 @@ class RealMoneyClient:
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares):
         """
-        Execute paired buy orders with proper precision handling.
+        Execute paired FOK buy orders using MarketOrderArgs.
         
-        Polymarket CLOB precision rules:
-        - Maker amount (shares for BUY): max 2 decimal places
-        - Taker amount ($): max 4 decimal places (depends on tick size)
-        - Price: must align with tick size (0.01, 0.001, 0.0001)
+        FIX for GitHub Issue #121:
+        - Use MarketOrderArgs to specify CASH amount directly (always 2 decimals)
+        - Use 'price' field as limit cap for protection
+        - FOK ensures both fill or neither (no partial fill risk)
+        
+        https://github.com/Polymarket/py-clob-client/issues/121
         """
-        from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-        
         if self.client is None:
             logger.error("❌ Cannot trade: CLOB Client not connected!")
             return False
@@ -669,75 +669,56 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
-            # Fetch tick size for proper price alignment
-            try:
-                tick_size_yes = self.client.get_tick_size(token_yes)
-                tick_size_no = self.client.get_tick_size(token_no)
-                neg_risk_yes = self.client.get_neg_risk(token_yes)
-                neg_risk_no = self.client.get_neg_risk(token_no)
-                logger.info(f"📊 Tick sizes: YES={tick_size_yes}, NO={tick_size_no}")
-            except Exception as e:
-                logger.warning(f"Could not fetch tick size: {e}, using default 0.01")
-                tick_size_yes = tick_size_no = "0.01"
-                neg_risk_yes = neg_risk_no = False
+            # Calculate CASH amount per side (must be exactly 2 decimals)
+            # Spend half of BET_SIZE on each side
+            cash_per_side = round(BET_SIZE / 2, 2)  # e.g., $2.50 if BET_SIZE = $5
             
-            # Convert to Decimal for precise calculations
-            dec_up_price = Decimal(str(up_price))
-            dec_down_price = Decimal(str(down_price))
-            dec_shares = Decimal(str(shares))
-            dec_tick_yes = Decimal(str(tick_size_yes))
-            dec_tick_no = Decimal(str(tick_size_no))
-            
-            # --- CRITICAL: Round shares (maker amount) to 2 decimal places ---
-            safe_shares = dec_shares.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-            
-            # Ensure shares are at least 0.01 (minimum tradeable)
-            if safe_shares < Decimal('0.01'):
-                logger.warning("Shares too small after rounding, skipping trade")
+            # Ensure minimum viable amount
+            if cash_per_side < 0.10:
+                logger.warning("Cash amount too small, skipping trade")
                 return False
             
-            # --- Round price to tick size alignment ---
-            # Calculate the number of ticks and round
-            def round_to_tick(price, tick):
-                """Round price to nearest tick size."""
-                ticks = (price / tick).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
-                return ticks * tick
+            # Calculate expected profit
+            total_spread = up_price + down_price
+            if total_spread >= 1.00:
+                logger.info(f"Spread {total_spread:.4f} too tight, skipping")
+                return False
             
-            safe_price_yes = round_to_tick(dec_up_price, dec_tick_yes)
-            safe_price_no = round_to_tick(dec_down_price, dec_tick_no)
+            # Add small price padding for slippage protection (1 cent)
+            max_price_yes = round(up_price + 0.01, 2)
+            max_price_no = round(down_price + 0.01, 2)
             
-            # Ensure prices are within valid range (0.01 to 0.99)
-            safe_price_yes = max(Decimal('0.01'), min(Decimal('0.99'), safe_price_yes))
-            safe_price_no = max(Decimal('0.01'), min(Decimal('0.99'), safe_price_no))
+            # Ensure prices don't exceed 0.99
+            max_price_yes = min(max_price_yes, 0.99)
+            max_price_no = min(max_price_no, 0.99)
             
-            # Calculate expected cost for logging
-            expected_cost = (safe_price_yes + safe_price_no) * safe_shares
-            
-            logger.info(f"🎯 Sending Orders:")
-            logger.info(f"   YES: Price={safe_price_yes}, Shares={safe_shares}")
-            logger.info(f"   NO:  Price={safe_price_no}, Shares={safe_shares}")
-            logger.info(f"   Expected cost: ${expected_cost:.2f}")
+            logger.info(f"🔫 Sending FOK Market Orders (MarketOrderArgs):")
+            logger.info(f"   YES: ${cash_per_side} @ max {max_price_yes}")
+            logger.info(f"   NO:  ${cash_per_side} @ max {max_price_no}")
+            logger.info(f"   Total spend: ${cash_per_side * 2}")
 
-            # Create Order Args with STRING values for precision
-            order_args_yes = OrderArgs(
+            # Create Market Orders with CASH amount (not shares!)
+            # Including 'price' acts as a limit cap for protection
+            order_args_yes = MarketOrderArgs(
                 token_id=token_yes,
-                price=float(safe_price_yes),  # Convert to float for SDK
-                size=float(safe_shares),
-                side=BUY
-            )
-            order_args_no = OrderArgs(
-                token_id=token_no,
-                price=float(safe_price_no),
-                size=float(safe_shares),
-                side=BUY
+                amount=cash_per_side,  # Spend exactly $X (2 decimals = compliant)
+                side=BUY,
+                price=max_price_yes    # Protection: Don't buy if price spikes!
             )
             
-            # Sign and post orders with FOK type
-            signed_yes = self.client.create_order(order_args_yes)
+            order_args_no = MarketOrderArgs(
+                token_id=token_no,
+                amount=cash_per_side,  # Spend exactly $X (2 decimals = compliant)
+                side=BUY,
+                price=max_price_no     # Protection
+            )
+            
+            # Create and post using create_market_order (not create_order!)
+            signed_yes = self.client.create_market_order(order_args_yes)
             resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
             logger.info(f"YES Order Response: {resp_yes}")
             
-            signed_no = self.client.create_order(order_args_no)
+            signed_no = self.client.create_market_order(order_args_no)
             resp_no = self.client.post_order(signed_no, OrderType.FOK)
             logger.info(f"NO Order Response: {resp_no}")
             
@@ -746,15 +727,15 @@ class RealMoneyClient:
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
 
             if yes_success and no_success:
-                logger.info(f"✅ REAL TRADE EXECUTED: Bought {safe_shares} shares.")
+                logger.info(f"✅ REAL TRADE EXECUTED: Spent ${cash_per_side * 2:.2f} total.")
                 self.total_trades += 1
                 return True
             else:
                 logger.error(f"❌ Trade Failed. Yes:{yes_success} No:{no_success}")
                 if not yes_success: 
-                    logger.error(f"Err YES: {resp_yes}")
+                    logger.error(f"Reason YES: {resp_yes}")
                 if not no_success: 
-                    logger.error(f"Err NO: {resp_no}")
+                    logger.error(f"Reason NO: {resp_no}")
                 return False
                 
         except Exception as e:
