@@ -3,70 +3,210 @@ import json
 import os
 import requests
 import logging
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0
 MIN_SPREAD_TARGET = 1.00
-POLL_INTERVAL = 2.0  # Slower for cloud (save API calls)
+POLL_INTERVAL = 2.0
 BET_SIZE = 10.0
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 TAG_15M = 102467
+WEB_PORT = int(os.environ.get('PORT', 8080))
 
-# State file for persistence
 STATE_FILE = "bot_state.json"
 
-# Setup Logging (cloud-friendly)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
+
+# Global state for web dashboard
+bot_status = {
+    'balance': INITIAL_BALANCE,
+    'initial_balance': INITIAL_BALANCE,
+    'total_trades': 0,
+    'markets_count': 0,
+    'best_spread': 1.02,
+    'checks': 0,
+    'last_update': '',
+    'recent_checks': [],
+    'running': True
+}
+
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Simple web dashboard"""
+    
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP logs
+    
+    def do_GET(self):
+        if self.path == '/api/status':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(bot_status).encode())
+        else:
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(self.get_dashboard_html().encode())
+    
+    def get_dashboard_html(self):
+        profit = bot_status['balance'] - bot_status['initial_balance']
+        profit_pct = (profit / bot_status['initial_balance']) * 100 if bot_status['initial_balance'] > 0 else 0
+        profit_color = '#22c55e' if profit >= 0 else '#ef4444'
+        
+        recent_html = ''
+        for check in bot_status.get('recent_checks', [])[-8:]:
+            total = check.get('total', 1.02)
+            if total < 1.00:
+                icon, color = '🔥', '#22c55e'
+            elif total < 1.01:
+                icon, color = '💰', '#eab308'
+            elif total <= 1.02:
+                icon, color = '⚡', '#06b6d4'
+            else:
+                icon, color = '·', '#6b7280'
+            recent_html += f'''
+            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #374151;">
+                <span>{icon} {check.get('q', 'Unknown')[:35]}</span>
+                <span style="color:{color};font-weight:bold;">{total:.4f}</span>
+            </div>'''
+        
+        return f'''<!DOCTYPE html>
+<html>
+<head>
+    <title>Polymarket Arbitrage Bot</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="10">
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            color: #e5e7eb;
+            min-height: 100vh;
+            padding: 20px;
+        }}
+        .container {{ max-width: 800px; margin: 0 auto; }}
+        .header {{ 
+            text-align: center; 
+            padding: 30px 0;
+            border-bottom: 1px solid #374151;
+            margin-bottom: 30px;
+        }}
+        .header h1 {{ font-size: 28px; margin-bottom: 10px; }}
+        .header .subtitle {{ color: #9ca3af; }}
+        .stats {{ 
+            display: grid; 
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }}
+        .stat {{ 
+            background: rgba(255,255,255,0.05);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+        }}
+        .stat-value {{ font-size: 28px; font-weight: bold; }}
+        .stat-label {{ color: #9ca3af; font-size: 14px; margin-top: 5px; }}
+        .section {{ 
+            background: rgba(255,255,255,0.03);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }}
+        .section h2 {{ margin-bottom: 15px; font-size: 18px; }}
+        .status-dot {{ 
+            display: inline-block;
+            width: 10px; height: 10px;
+            background: #22c55e;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }}
+        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
+        .footer {{ text-align: center; color: #6b7280; margin-top: 30px; font-size: 14px; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📈 Polymarket Arbitrage Bot</h1>
+            <p class="subtitle"><span class="status-dot"></span>Running on Railway</p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-value" style="color:#22c55e;">${bot_status['balance']:.2f}</div>
+                <div class="stat-label">Balance</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value" style="color:{profit_color};">${profit:+.2f}</div>
+                <div class="stat-label">Profit ({profit_pct:+.1f}%)</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{bot_status['total_trades']}</div>
+                <div class="stat-label">Total Trades</div>
+            </div>
+            <div class="stat">
+                <div class="stat-value">{bot_status['best_spread']:.4f}</div>
+                <div class="stat-label">Best Spread</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <h2>📊 Recent Market Checks</h2>
+            {recent_html if recent_html else '<p style="color:#6b7280;">Waiting for data...</p>'}
+        </div>
+        
+        <div class="section">
+            <h2>ℹ️ Stats</h2>
+            <p>Markets Monitored: <strong>{bot_status['markets_count']}</strong></p>
+            <p>Total Checks: <strong>{bot_status['checks']}</strong></p>
+            <p>Last Update: <strong>{bot_status['last_update']}</strong></p>
+        </div>
+        
+        <div class="footer">
+            Auto-refreshes every 10 seconds • <a href="/api/status" style="color:#06b6d4;">API</a>
+        </div>
+    </div>
+</body>
+</html>'''
 
 
 class PersistentMockClient:
-    """Paper Trading Client with persistent state."""
-    
     def __init__(self, initial_balance=1000.0):
         self.balance = initial_balance
         self.positions = {}
         self.trade_history = []
         self.total_trades = 0
-        self.total_profit = 0.0
         self._load_state()
 
     def _load_state(self):
-        """Load state from file if exists."""
         if os.path.exists(STATE_FILE):
             try:
                 with open(STATE_FILE, 'r') as f:
                     state = json.load(f)
                 self.balance = state.get('balance', self.balance)
-                self.positions = state.get('positions', {})
                 self.total_trades = state.get('total_trades', 0)
-                self.total_profit = state.get('total_profit', 0.0)
-                logger.info(f"📂 Restored state: Balance=${self.balance:.2f}, Trades={self.total_trades}")
-            except Exception as e:
-                logger.warning(f"Could not load state: {e}")
+                logger.info(f"📂 Restored: Balance=${self.balance:.2f}, Trades={self.total_trades}")
+            except:
+                pass
 
     def _save_state(self):
-        """Save current state to file."""
         try:
-            state = {
-                'balance': self.balance,
-                'positions': self.positions,
-                'total_trades': self.total_trades,
-                'total_profit': self.total_profit,
-                'last_updated': datetime.now().isoformat()
-            }
             with open(STATE_FILE, 'w') as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            logger.error(f"Could not save state: {e}")
+                json.dump({'balance': self.balance, 'total_trades': self.total_trades, 'updated': datetime.now().isoformat()}, f)
+        except:
+            pass
 
     def buy(self, market_id, outcome, price, size_shares):
         cost = price * size_shares
@@ -76,13 +216,6 @@ class PersistentMockClient:
         if market_id not in self.positions:
             self.positions[market_id] = {'UP': 0.0, 'DOWN': 0.0}
         self.positions[market_id][outcome] += size_shares
-        self.trade_history.append({
-            'time': datetime.now().isoformat(),
-            'action': 'BUY',
-            'outcome': outcome,
-            'price': price,
-            'shares': size_shares
-        })
         logger.info(f"⚡ BOUGHT {size_shares:.2f} {outcome} @ ${price:.3f}")
         return True
 
@@ -94,16 +227,9 @@ class PersistentMockClient:
         if mergeable > 0:
             pos['UP'] -= mergeable
             pos['DOWN'] -= mergeable
-            payout = mergeable * 1.00
-            self.balance += payout
+            self.balance += mergeable * 1.00
             self.total_trades += 1
-            
-            # Calculate profit (approx - assumes bought at ~0.50 each)
-            cost = mergeable * 1.0  # Rough estimate
-            profit = payout - cost
-            self.total_profit += max(0, profit * 0.02)  # Rough profit estimate
-            
-            logger.info(f"💎 SETTLED {mergeable:.2f} pairs | Balance: ${self.balance:.2f}")
+            logger.info(f"💎 SETTLED | Balance: ${self.balance:.2f}")
             self._save_state()
 
 
@@ -113,20 +239,10 @@ class ArbitrageBot:
         self.mock_client = PersistentMockClient(initial_balance=INITIAL_BALANCE)
         self.target_markets = []
         self.last_scan_time = 0
-        self.last_status_time = 0
-        self.stats = {
-            'checks': 0,
-            'best_spread': 1.02,
-            'opportunities': 0
-        }
 
     def scan_markets(self):
         try:
-            resp = requests.get(
-                f"{GAMMA_API_URL}/markets",
-                params={'active': 'true', 'closed': 'false', 'tag_id': TAG_15M, 'limit': 50},
-                timeout=15
-            )
+            resp = requests.get(f"{GAMMA_API_URL}/markets", params={'active': 'true', 'closed': 'false', 'tag_id': TAG_15M, 'limit': 50}, timeout=15)
             if resp.status_code == 200:
                 markets = resp.json()
                 found = []
@@ -143,47 +259,41 @@ class ArbitrageBot:
                         found.append(m)
                 self.target_markets = found
                 self.last_scan_time = time.time()
-                logger.info(f"🔍 Scanned: {len(found)} markets active")
+                bot_status['markets_count'] = len(found)
+                logger.info(f"🔍 Scanned: {len(found)} markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
     def check_for_arbitrage(self):
-        if not self.target_markets:
-            return
-
         for market in self.target_markets:
             try:
                 tokens = market.get('_tokens', [])
                 if len(tokens) < 2:
                     continue
-
                 ob_up = self.clob_client.get_order_book(tokens[0])
                 ob_down = self.clob_client.get_order_book(tokens[1])
-
                 ask_up = self._get_best_ask(ob_up)
                 ask_down = self._get_best_ask(ob_down)
-
                 if ask_up is None or ask_down is None:
                     continue
 
-                self.stats['checks'] += 1
+                bot_status['checks'] += 1
                 total = ask_up + ask_down
-
-                if total < self.stats['best_spread']:
-                    self.stats['best_spread'] = total
+                
+                if total < bot_status['best_spread']:
+                    bot_status['best_spread'] = total
+                
+                q = market.get('question', '')[:35]
+                bot_status['recent_checks'].append({'q': q, 'up': ask_up, 'down': ask_down, 'total': total})
+                if len(bot_status['recent_checks']) > 10:
+                    bot_status['recent_checks'].pop(0)
 
                 if total < MIN_SPREAD_TARGET:
-                    self.stats['opportunities'] += 1
                     profit = 1.00 - total
-                    
                     if profit >= PROFIT_THRESHOLD:
-                        q = market.get('question', '')[:40]
-                        logger.info(f"🎯 ARBITRAGE! {q}")
-                        logger.info(f"   Spread: {total:.4f} | Profit: ${profit:.4f}/share")
-                        
+                        logger.info(f"🎯 ARBITRAGE! {q} | Spread: {total:.4f}")
                         shares = round(BET_SIZE / total, 2)
                         cid = market.get('conditionId')
-                        
                         if self.mock_client.buy(cid, 'UP', ask_up, shares):
                             if self.mock_client.buy(cid, 'DOWN', ask_down, shares):
                                 self.mock_client.merge_and_settle(cid)
@@ -202,42 +312,31 @@ class ArbitrageBot:
             pass
         return None
 
-    def print_status(self):
-        logger.info("=" * 50)
-        logger.info(f"📊 STATUS REPORT")
-        logger.info(f"   Balance: ${self.mock_client.balance:.2f}")
-        logger.info(f"   Total Trades: {self.mock_client.total_trades}")
-        logger.info(f"   Markets: {len(self.target_markets)}")
-        logger.info(f"   Best Spread: {self.stats['best_spread']:.4f}")
-        logger.info(f"   Checks: {self.stats['checks']}")
-        logger.info("=" * 50)
+    def update_status(self):
+        bot_status['balance'] = self.mock_client.balance
+        bot_status['total_trades'] = self.mock_client.total_trades
+        bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
 
     def run(self):
-        logger.info("=" * 50)
-        logger.info("🚀 POLYMARKET ARBITRAGE BOT (24/7 Mode)")
-        logger.info("=" * 50)
+        logger.info("🚀 Starting Polymarket Bot with Web Dashboard")
+        logger.info(f"📊 Dashboard: http://localhost:{WEB_PORT}")
+        
+        # Start web server in background
+        server = HTTPServer(('0.0.0.0', WEB_PORT), DashboardHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
         
         self.scan_markets()
-        self.last_status_time = time.time()
         
         while True:
             try:
-                # Rescan every 60 seconds
                 if time.time() - self.last_scan_time > 60:
                     self.scan_markets()
-                
-                # Status every 5 minutes
-                if time.time() - self.last_status_time > 300:
-                    self.print_status()
-                    self.last_status_time = time.time()
-                
                 self.check_for_arbitrage()
+                self.update_status()
                 time.sleep(POLL_INTERVAL)
-                
             except KeyboardInterrupt:
-                logger.info("🛑 Stopping bot...")
+                logger.info("🛑 Stopping...")
                 self.mock_client._save_state()
-                self.print_status()
                 break
             except Exception as e:
                 logger.error(f"Error: {e}")
