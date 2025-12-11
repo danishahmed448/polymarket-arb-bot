@@ -289,7 +289,7 @@ class ArbitrageBot:
                 params = {
                     'active': 'true', 
                     'closed': 'false', 
-                    # 'tag_id': TAG_15M,  # REMOVED: Now scans ALL markets!
+                    'tag_id': 1,  # 1 = All Crypto markets
                     'limit': limit,
                     'offset': offset
                 }
