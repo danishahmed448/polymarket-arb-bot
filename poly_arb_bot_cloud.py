@@ -20,9 +20,52 @@ BET_SIZE = 2.0                # Reduced for better fills on both sides
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
-TAG_15M = 102467                # 15-min Crypto Up/Down markets (WORKING TAG!)
-CRYPTO_KEYWORDS = ['bitcoin', 'solana', 'ethereum', 'xrp']  # Filter for crypto only
 WEB_PORT = int(os.environ.get('PORT', 8080))
+
+# --- Multi-Timeframe Configuration ---
+# Discovered from Polymarket API (Chrome Network Tab)
+TIMEFRAME_CONFIG = {
+    '15-min': {
+        'endpoint': 'events/pagination',
+        'params': {
+            'limit': 100, 'active': 'true', 'archived': 'false',
+            'tag_slug': '15M', 'closed': 'false',
+            'order': 'volume24hr', 'ascending': 'false', 'offset': 0
+        }
+    },
+    '1-hour': {
+        'endpoint': 'events/pagination',
+        'params': {
+            'limit': 100, 'active': 'true', 'archived': 'false',
+            'tag_slug': '1H', 'closed': 'false',
+            'order': 'volume24hr', 'ascending': 'false', 'offset': 0
+        }
+    },
+    '4-hour': {
+        'endpoint': 'events',
+        'params': {
+            'tag_id': 102531, 'closed': 'false', 'limit': 100
+        }
+    },
+    'Daily': {
+        'endpoint': 'events/pagination',
+        'params': {
+            'limit': 100, 'active': 'true', 'archived': 'false',
+            'tag_slug': 'daily', 'closed': 'false',
+            'order': 'volume24hr', 'ascending': 'false', 'offset': 0
+        }
+    },
+}
+
+# Which timeframes to scan (set to True to enable)
+ENABLED_TIMEFRAMES = {
+    '15-min': True,
+    '1-hour': True,
+    '4-hour': True,
+    'Daily': True,
+}
+
+COINS = ['bitcoin', 'btc', 'ethereum', 'eth', 'solana', 'sol', 'xrp']
 
 # Speed Optimization Settings
 MAX_WORKERS = 10              # Parallel order book fetches
@@ -280,78 +323,82 @@ class ArbitrageBot:
             bot_status['total_trades'] = self.real_client.total_trades
 
     def scan_markets(self):
-        """DEBUG VERSION: Using tag_id=21 (Crypto) to see what Railway returns"""
+        """Scan all enabled timeframes for crypto Up/Down markets."""
         try:
-            # Try tag_id=21 (Crypto tag from /tags endpoint)
-            resp = requests.get(
-                f"{GAMMA_API_URL}/markets",
-                params={
-                    'active': 'true',
-                    'closed': 'false',
-                    'tag_id': 21,  # Crypto tag
-                    'limit': 200
-                },
-                timeout=15
-            )
-            
-            if resp.status_code != 200:
-                logger.error(f"API returned {resp.status_code}")
-                return
-            
-            data = resp.json()
-            markets = data if isinstance(data, list) else data.get('markets', [])
-            
-            logger.info(f"📡 tag_id=21 returned {len(markets)} markets")
-            
-            # Log first 5 market questions
-            logger.info("=== FIRST 5 MARKET QUESTIONS ===")
-            for i, m in enumerate(markets[:5]):
-                q = m.get('question', 'NO QUESTION')[:60]
-                logger.info(f"  {i+1}. {q}")
-            
-            # Count markets with different keywords
-            up_down_count = 0
-            crypto_count = 0
-            both_count = 0
-            
-            for m in markets:
-                q = m.get('question', '').lower()
-                has_up_down = 'up or down' in q
-                has_crypto = any(kw in q for kw in ['bitcoin', 'ethereum', 'solana', 'xrp', 'btc', 'eth', 'sol'])
-                
-                if has_up_down: up_down_count += 1
-                if has_crypto: crypto_count += 1
-                if has_up_down and has_crypto: both_count += 1
-            
-            logger.info(f"📊 STATS: up_down={up_down_count}, crypto={crypto_count}, BOTH={both_count}")
-            
-            # Filter for crypto up/down markets
             found = []
-            for m in markets:
-                if m.get('closed') or not m.get('active', True):
+            
+            logger.info("🔄 Scanning multi-timeframe crypto markets...")
+            
+            for timeframe, config in TIMEFRAME_CONFIG.items():
+                # Skip disabled timeframes
+                if not ENABLED_TIMEFRAMES.get(timeframe, False):
                     continue
                 
-                q = m.get('question', '').lower()
-                if 'up or down' not in q:
-                    continue
-                if not any(kw in q for kw in CRYPTO_KEYWORDS):
-                    continue
+                url = f"{GAMMA_API_URL}/{config['endpoint']}"
                 
                 try:
-                    clob_ids_str = m.get('clobTokenIds', '[]')
-                    clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                except:
-                    clob_ids = []
+                    resp = requests.get(url, params=config['params'], timeout=30)
+                    
+                    if resp.status_code != 200:
+                        logger.warning(f"  {timeframe}: API error {resp.status_code}")
+                        continue
+                    
+                    data = resp.json()
+                    
+                    # Handle different response formats
+                    if isinstance(data, dict):
+                        events = data.get('data', data.get('events', []))
+                    else:
+                        events = data
+                    
+                    tf_count = 0
+                    
+                    for event in events:
+                        title = event.get('title', '')
+                        slug = event.get('slug', '')
+                        
+                        # Check if it's a crypto event
+                        is_crypto = any(coin in (title + slug).lower() for coin in COINS)
+                        if not is_crypto:
+                            continue
+                        
+                        # Extract markets from event
+                        markets = event.get('markets', [])
+                        
+                        for m in markets:
+                            # Parse tokens
+                            try:
+                                tokens = m.get('clobTokenIds', [])
+                                if isinstance(tokens, str):
+                                    tokens = json.loads(tokens)
+                            except:
+                                tokens = []
+                            
+                            if len(tokens) < 2:
+                                continue
+                            
+                            # Add market with metadata
+                            m['_tokens'] = tokens
+                            m['_timeframe'] = timeframe
+                            m['_event_slug'] = slug
+                            found.append(m)
+                            tf_count += 1
+                    
+                    logger.info(f"  {timeframe}: {tf_count} markets")
+                    
+                except Exception as e:
+                    logger.error(f"  {timeframe}: Error - {e}")
                 
-                if clob_ids and len(clob_ids) >= 2:
-                    m['_tokens'] = clob_ids
-                    found.append(m)
+                time.sleep(0.1)  # Rate limit between timeframes
             
             self.target_markets = found
             self.last_scan_time = time.time()
+            
             with status_lock:
                 bot_status['markets_count'] = len(found)
-            logger.info(f"🔍 Final: {len(found)} crypto Up/Down markets")
+            
+            logger.info(f"🔍 Total: {len(found)} crypto Up/Down markets across all timeframes")
+            
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
