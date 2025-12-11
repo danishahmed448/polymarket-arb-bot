@@ -9,6 +9,7 @@ import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds
 from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
@@ -181,15 +182,20 @@ class RealMoneyClient:
         logger.info(f"🔑 POLY_API_KEY set: {bool(os.environ.get('POLY_API_KEY'))}")
         
         try:
+            # Build API credentials object
+            creds = ApiCreds(
+                api_key=os.environ.get("POLY_API_KEY"),
+                api_secret=os.environ.get("POLY_API_SECRET"),
+                api_passphrase=os.environ.get("POLY_API_PASSPHRASE")
+            )
+            
             self.client = ClobClient(
                 self.host,
                 key=self.key,
                 chain_id=self.chain_id,
                 signature_type=2, 
-                funder=os.environ.get("FUNDER_ADDRESS"), 
-                api_key=os.environ.get("POLY_API_KEY"),
-                api_secret=os.environ.get("POLY_API_SECRET"),
-                api_passphrase=os.environ.get("POLY_API_PASSPHRASE")
+                funder=os.environ.get("FUNDER_ADDRESS"),
+                creds=creds  # Use creds object instead of individual params
             )
             logger.info("✅ Connected to Polymarket CLOB Client (Real Money)")
         except Exception as e:
