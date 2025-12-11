@@ -187,7 +187,7 @@ class RealMoneyClient:
                 self.host,
                 key=self.key,
                 chain_id=self.chain_id,
-                signature_type=0,  # 0 for EOA/MetaMask wallets
+                signature_type=1,  # 1 for email/Magic wallet (Polymarket managed)
                 funder=self.funder
             )
             
