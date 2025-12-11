@@ -9,14 +9,14 @@ import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
 MIN_SPREAD_TARGET = 1.0       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
-BET_SIZE = 5.0                # Live Risk: $5.00 per trade
+BET_SIZE = 2.0                # Reduced for better fills on both sides
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
@@ -213,27 +213,35 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
-            # Calculate dollar amount for each side (half of bet size each)
-            amount_per_side = round(BET_SIZE / 2, 2)
+            # --- CRITICAL FIX: SANITIZE FLOATS ---
+            # Python's round() leaves artifacts (e.g. 0.3000000004).
+            # Use f-string formatting to strip floating point ghosts.
+            safe_price_yes = float(f"{up_price:.2f}")
+            safe_price_no = float(f"{down_price:.2f}")
+            safe_size = float(f"{shares:.2f}")
             
-            # Use MarketOrderArgs with dollar amount (official FOK method)
-            order_args_yes = MarketOrderArgs(
+            logger.info(f"🔫 Sending FOK Order: Price {safe_price_yes}/{safe_price_no}, Size {safe_size}")
+
+            # Create Order Args with SANITIZED values
+            order_args_yes = OrderArgs(
                 token_id=token_yes,
-                amount=amount_per_side,
+                price=safe_price_yes,
+                size=safe_size,
                 side=BUY
             )
-            order_args_no = MarketOrderArgs(
+            order_args_no = OrderArgs(
                 token_id=token_no,
-                amount=amount_per_side,
+                price=safe_price_no,
+                size=safe_size,
                 side=BUY
             )
             
-            # Create and post market orders with FOK
-            signed_yes = self.client.create_market_order(order_args_yes)
+            # Sign and post orders with FOK type
+            signed_yes = self.client.create_order(order_args_yes)
             resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
             logger.info(f"YES Order Response: {resp_yes}")
             
-            signed_no = self.client.create_market_order(order_args_no)
+            signed_no = self.client.create_order(order_args_no)
             resp_no = self.client.post_order(signed_no, OrderType.FOK)
             logger.info(f"NO Order Response: {resp_no}")
             
@@ -242,11 +250,13 @@ class RealMoneyClient:
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
 
             if yes_success and no_success:
-                logger.info(f"✅ REAL TRADE EXECUTED: ${amount_per_side} on each side.")
+                logger.info(f"✅ REAL TRADE EXECUTED: Bought {safe_size} shares.")
                 self.total_trades += 1
                 return True
             else:
                 logger.error(f"❌ Trade Failed. Yes:{yes_success} No:{no_success}")
+                if not yes_success: logger.error(f"Err YES: {resp_yes}")
+                if not no_success: logger.error(f"Err NO: {resp_no}")
                 return False
                 
         except Exception as e:
