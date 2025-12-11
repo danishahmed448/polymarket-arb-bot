@@ -664,7 +664,37 @@ class RealMoneyClient:
         self.update_balance()
 
     def update_balance(self):
-        self.balance = 100.0  # Placeholder for dashboard
+        """Fetch real USDC balance from Polygon."""
+        try:
+            if not self.funder:
+                self.balance = 0.0
+                return
+            
+            # ERC20 balanceOf ABI
+            erc20_abi = [{
+                "inputs": [{"name": "account", "type": "address"}],
+                "name": "balanceOf",
+                "outputs": [{"name": "", "type": "uint256"}],
+                "stateMutability": "view",
+                "type": "function"
+            }]
+            
+            w3 = Web3(Web3.HTTPProvider(RPC_URL))
+            usdc = w3.eth.contract(
+                address=Web3.to_checksum_address(USDC_ADDRESS),
+                abi=erc20_abi
+            )
+            
+            balance_wei = usdc.functions.balanceOf(
+                Web3.to_checksum_address(self.funder)
+            ).call()
+            
+            self.balance = balance_wei / (10 ** USDCE_DIGITS)
+            logger.info(f"💰 USDC Balance: ${self.balance:.2f}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to fetch USDC balance: {e}")
+            self.balance = 0.0
     
     def has_traded_market(self, condition_id):
         """Check if we've already traded this market."""
@@ -1013,6 +1043,9 @@ class ArbitrageBot:
     def scan_markets(self):
         """Scan all enabled timeframes for LIVE crypto Up/Down markets only."""
         try:
+            # Refresh USDC balance
+            self.real_client.update_balance()
+            
             found = []
             
             logger.info("🔄 Scanning LIVE crypto markets (4 per timeframe)...")
