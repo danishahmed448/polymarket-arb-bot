@@ -651,6 +651,16 @@ class RealMoneyClient:
         self.balance = 100.0  # Placeholder for dashboard
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares):
+        """
+        Execute paired buy orders with proper precision handling.
+        
+        Polymarket CLOB precision rules:
+        - Maker amount (shares for BUY): max 2 decimal places
+        - Taker amount ($): max 4 decimal places (depends on tick size)
+        - Price: must align with tick size (0.01, 0.001, 0.0001)
+        """
+        from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+        
         if self.client is None:
             logger.error("❌ Cannot trade: CLOB Client not connected!")
             return False
@@ -659,26 +669,66 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
-            # --- CRITICAL FIX: SANITIZE FLOATS ---
-            # Python's round() leaves artifacts (e.g. 0.3000000004).
-            # Use f-string formatting to strip floating point ghosts.
-            safe_price_yes = float(f"{up_price:.2f}")
-            safe_price_no = float(f"{down_price:.2f}")
-            safe_size = float(f"{shares:.2f}")
+            # Fetch tick size for proper price alignment
+            try:
+                tick_size_yes = self.client.get_tick_size(token_yes)
+                tick_size_no = self.client.get_tick_size(token_no)
+                neg_risk_yes = self.client.get_neg_risk(token_yes)
+                neg_risk_no = self.client.get_neg_risk(token_no)
+                logger.info(f"📊 Tick sizes: YES={tick_size_yes}, NO={tick_size_no}")
+            except Exception as e:
+                logger.warning(f"Could not fetch tick size: {e}, using default 0.01")
+                tick_size_yes = tick_size_no = "0.01"
+                neg_risk_yes = neg_risk_no = False
             
-            logger.info(f"🔫 Sending FOK Order: Price {safe_price_yes}/{safe_price_no}, Size {safe_size}")
+            # Convert to Decimal for precise calculations
+            dec_up_price = Decimal(str(up_price))
+            dec_down_price = Decimal(str(down_price))
+            dec_shares = Decimal(str(shares))
+            dec_tick_yes = Decimal(str(tick_size_yes))
+            dec_tick_no = Decimal(str(tick_size_no))
+            
+            # --- CRITICAL: Round shares (maker amount) to 2 decimal places ---
+            safe_shares = dec_shares.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
+            
+            # Ensure shares are at least 0.01 (minimum tradeable)
+            if safe_shares < Decimal('0.01'):
+                logger.warning("Shares too small after rounding, skipping trade")
+                return False
+            
+            # --- Round price to tick size alignment ---
+            # Calculate the number of ticks and round
+            def round_to_tick(price, tick):
+                """Round price to nearest tick size."""
+                ticks = (price / tick).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                return ticks * tick
+            
+            safe_price_yes = round_to_tick(dec_up_price, dec_tick_yes)
+            safe_price_no = round_to_tick(dec_down_price, dec_tick_no)
+            
+            # Ensure prices are within valid range (0.01 to 0.99)
+            safe_price_yes = max(Decimal('0.01'), min(Decimal('0.99'), safe_price_yes))
+            safe_price_no = max(Decimal('0.01'), min(Decimal('0.99'), safe_price_no))
+            
+            # Calculate expected cost for logging
+            expected_cost = (safe_price_yes + safe_price_no) * safe_shares
+            
+            logger.info(f"🎯 Sending Orders:")
+            logger.info(f"   YES: Price={safe_price_yes}, Shares={safe_shares}")
+            logger.info(f"   NO:  Price={safe_price_no}, Shares={safe_shares}")
+            logger.info(f"   Expected cost: ${expected_cost:.2f}")
 
-            # Create Order Args with SANITIZED values
+            # Create Order Args with STRING values for precision
             order_args_yes = OrderArgs(
                 token_id=token_yes,
-                price=safe_price_yes,
-                size=safe_size,
+                price=float(safe_price_yes),  # Convert to float for SDK
+                size=float(safe_shares),
                 side=BUY
             )
             order_args_no = OrderArgs(
                 token_id=token_no,
-                price=safe_price_no,
-                size=safe_size,
+                price=float(safe_price_no),
+                size=float(safe_shares),
                 side=BUY
             )
             
@@ -696,17 +746,21 @@ class RealMoneyClient:
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
 
             if yes_success and no_success:
-                logger.info(f"✅ REAL TRADE EXECUTED: Bought {safe_size} shares.")
+                logger.info(f"✅ REAL TRADE EXECUTED: Bought {safe_shares} shares.")
                 self.total_trades += 1
                 return True
             else:
                 logger.error(f"❌ Trade Failed. Yes:{yes_success} No:{no_success}")
-                if not yes_success: logger.error(f"Err YES: {resp_yes}")
-                if not no_success: logger.error(f"Err NO: {resp_no}")
+                if not yes_success: 
+                    logger.error(f"Err YES: {resp_yes}")
+                if not no_success: 
+                    logger.error(f"Err NO: {resp_no}")
                 return False
                 
         except Exception as e:
             logger.error(f"Real Trade Exception: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
     def merge_and_settle(self, condition_id):
@@ -759,6 +813,10 @@ class ArbitrageBot:
                     for event in events:
                         title = event.get('title', '')
                         slug = event.get('slug', '')
+                        
+                        # STRICT FILTER: Only "Up or Down" markets, not ETF flows etc
+                        if 'up or down' not in title.lower() and 'updown' not in slug.lower():
+                            continue
                         
                         coin = detect_coin(title + ' ' + slug)
                         if not coin:
@@ -840,9 +898,17 @@ class ArbitrageBot:
                 if ask_up is None or ask_down is None: return None
 
                 total = ask_up + ask_down
-                q = market.get('question', '')[:35]
+                q = market.get('question', '')[:40]
                 market['_last_spread'] = total
-                return {'q': q, 'up': ask_up, 'down': ask_down, 'total': total, 'market': market}
+                
+                # Get coin and timeframe
+                coin = market.get('_coin', 'UNK')
+                timeframe = market.get('_timeframe', '?')
+                
+                return {
+                    'q': q, 'up': ask_up, 'down': ask_down, 'total': total, 
+                    'market': market, 'coin': coin, 'timeframe': timeframe
+                }
             except Exception:
                 return None
 
@@ -853,6 +919,73 @@ class ArbitrageBot:
                 res = future.result()
                 if res: results.append(res)
         
+        # --- TERMINAL UI OUTPUT ---
+        if results:
+            # Group by timeframe
+            by_timeframe = {}
+            for r in results:
+                tf = r['timeframe']
+                if tf not in by_timeframe:
+                    by_timeframe[tf] = []
+                by_timeframe[tf].append(r)
+            
+            # Print header
+            print("\n" + "═" * 70)
+            print(f"  📊 LIVE SPREAD SCANNER | {datetime.now().strftime('%H:%M:%S')} | {len(results)} markets")
+            print("═" * 70)
+            
+            # Coin colors (ANSI)
+            COLORS = {
+                'BTC': '\033[38;5;208m',  # Orange
+                'ETH': '\033[38;5;99m',   # Purple
+                'SOL': '\033[38;5;135m',  # Violet
+                'XRP': '\033[38;5;245m',  # Gray
+            }
+            RESET = '\033[0m'
+            GREEN = '\033[92m'
+            YELLOW = '\033[93m'
+            BLUE = '\033[94m'
+            DIM = '\033[2m'
+            
+            # Print each timeframe
+            for tf in ['15-min', '1-hour', '4-hour', 'Daily']:
+                if tf not in by_timeframe:
+                    continue
+                
+                tf_results = sorted(by_timeframe[tf], key=lambda x: x['total'])
+                
+                print(f"\n  ┌─ {tf.upper()} {'─' * (60 - len(tf))}")
+                
+                for r in tf_results:
+                    coin = r['coin']
+                    total = r['total']
+                    up = r['up']
+                    down = r['down']
+                    
+                    # Determine status
+                    if total < 1.00:
+                        status = f"{GREEN}★ ARB!{RESET}"
+                        spread_color = GREEN
+                    elif total < 1.01:
+                        status = f"{YELLOW}◆ CLOSE{RESET}"
+                        spread_color = YELLOW
+                    elif total <= 1.02:
+                        status = f"{BLUE}● OK{RESET}"
+                        spread_color = BLUE
+                    else:
+                        status = f"{DIM}○ WAIT{RESET}"
+                        spread_color = DIM
+                    
+                    coin_colored = f"{COLORS.get(coin, '')}{coin:>3}{RESET}"
+                    spread_str = f"{spread_color}{total:.4f}{RESET}"
+                    
+                    print(f"  │  {coin_colored}  UP:{up:.2f}  DOWN:{down:.2f}  │  Spread: {spread_str}  {status}")
+                
+                print(f"  └{'─' * 67}")
+            
+            print()
+        
+        # Update status for dashboard
         for res in results:
             total = res['total']
             with status_lock:
