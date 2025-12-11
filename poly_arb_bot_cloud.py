@@ -187,8 +187,8 @@ class RealMoneyClient:
                 self.host,
                 key=self.key,
                 chain_id=self.chain_id,
-                signature_type=0,  # 0 for EOA/MetaMask wallets
-                funder=self.funder
+                signature_type=2,  # 2 for Polymarket proxy wallet
+                funder=self.funder  # Use Polymarket profile address, NOT MetaMask!
             )
             
             # Derive API credentials automatically (official method)
