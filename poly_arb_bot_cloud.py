@@ -280,43 +280,21 @@ class ArbitrageBot:
 
     def scan_markets(self):
         try:
-            found = []
-            offset = 0
-            limit = 100  # Fetch max allowed per request
-            
-            while True:
-                # 1. Request a page of markets
-                params = {
-                    'active': 'true', 
-                    'closed': 'false', 
-                    'tag_id': 1,  # 1 = All Crypto markets
-                    'limit': limit,
-                    'offset': offset
-                }
-                
-                resp = requests.get(f"{GAMMA_API_URL}/markets", params=params, timeout=15)
-                
-                if resp.status_code != 200:
-                    logger.error(f"Scan failed: {resp.status_code}")
-                    break
-
+            resp = requests.get(f"{GAMMA_API_URL}/markets", params={'active': 'true', 'closed': 'false', 'tag_id': TAG_15M, 'limit': 50}, timeout=15)
+            if resp.status_code == 200:
                 data = resp.json()
-                
-                # 2. Extract list safely
-                current_batch = []
+                # Safety check for list format
                 if isinstance(data, list):
-                    current_batch = data
+                    markets = data
                 elif isinstance(data, dict) and 'markets' in data:
-                    current_batch = data['markets']
-                
-                if not current_batch:
-                    break  # Stop if no more markets returned
+                    markets = data['markets']
+                else:
+                    return
 
-                # 3. Filter and Add to list
-                for m in current_batch:
+                found = []
+                for m in markets:
                     if m.get('closed') or not m.get('active', True): continue
                     
-                    # Extract Token IDs
                     try:
                         clob_ids_str = m.get('clobTokenIds', '[]')
                         clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
@@ -326,22 +304,11 @@ class ArbitrageBot:
                         m['_tokens'] = clob_ids
                         found.append(m)
                 
-                # 4. Prepare for next page
-                offset += limit
-                time.sleep(0.2)  # Polite delay to avoid hammering the API
-                
-                # Safety Limit: Stop after scanning 500 markets
-                if len(found) >= 500: 
-                    logger.info("Reached safety limit of 500 markets.")
-                    break
-
-            self.target_markets = found
-            self.last_scan_time = time.time()
-            
-            with status_lock:
-                bot_status['markets_count'] = len(found)
-            logger.info(f"🔍 Scanned Total: {len(found)} markets")
-            
+                self.target_markets = found
+                self.last_scan_time = time.time()
+                with status_lock:
+                    bot_status['markets_count'] = len(found)
+                logger.info(f"🔍 Scanned: {len(found)} markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
