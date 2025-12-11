@@ -299,6 +299,8 @@ class CloudPersistentClient:
             data = {
                 'balance': self.balance,
                 'total_trades': self.total_trades,
+                'total_checks': bot_status.get('checks', 0),
+                'best_spread': bot_status.get('best_spread', 1.02),
                 'last_updated': datetime.now().isoformat()
             }
             resp = requests.put(JSONBIN_URL, headers=headers, json=data, timeout=10)
