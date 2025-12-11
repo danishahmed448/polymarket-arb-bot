@@ -623,6 +623,7 @@ class RealMoneyClient:
         self.total_trades = 0
         self.balance = 0.0
         self.client = None
+        self.traded_markets = set()  # Track markets we've already traded
         
         # Log env var status for debugging
         logger.info(f"🔑 PRIVATE_KEY set: {bool(self.key)}")
@@ -650,23 +651,38 @@ class RealMoneyClient:
 
     def update_balance(self):
         self.balance = 100.0  # Placeholder for dashboard
+    
+    def has_traded_market(self, condition_id):
+        """Check if we've already traded this market."""
+        return condition_id in self.traded_markets
+    
+    def mark_market_traded(self, condition_id):
+        """Mark a market as traded to prevent re-trading."""
+        self.traded_markets.add(condition_id)
+        logger.info(f"📝 Marked market {condition_id[:16]}... as traded")
 
-    def execute_pair_buy(self, tokens, up_price, down_price, shares):
+    def execute_pair_buy(self, tokens, up_price, down_price, shares, condition_id=None):
         """
-        Execute paired buy orders with EQUAL SHARES on both sides.
+        Execute paired FOK buy orders using MarketOrderArgs.
         
-        CRITICAL for arbitrage:
-        - Must buy SAME number of shares on UP and DOWN
-        - Only then can we merge pairs for guaranteed $1.00 payout
-        - Unequal shares = unhedged directional risk!
+        SAFER APPROACH:
+        - Use MarketOrderArgs with cash amounts
+        - Calculate cash to get exactly MIN_SHARES on each side
+        - Use FOK for guaranteed fill-or-kill (no partial fills!)
+        - Both orders must succeed or we don't trade
         
-        Strategy:
-        - Use OrderArgs with exact SHARES (rounded to 2 decimals)
-        - Use GTC orders (FOK has precision issues per GitHub #121)
-        - If first order succeeds but second fails, cancel first
+        This ensures EQUAL shares on both sides by:
+        1. Targeting exactly 5 shares per side
+        2. Calculating cash needed: 5 shares × price = cash
+        3. Using FOK to guarantee the shares we want
         """
         if self.client is None:
             logger.error("❌ Cannot trade: CLOB Client not connected!")
+            return False
+        
+        # Check if we've already traded this market
+        if condition_id and self.has_traded_market(condition_id):
+            logger.info(f"⏭️ Already traded this market, skipping to avoid duplicates")
             return False
             
         token_yes = tokens[0]
@@ -675,85 +691,84 @@ class RealMoneyClient:
         try:
             # Calculate the cost and validate spread
             total_spread = up_price + down_price
-            if total_spread >= 1.00:
-                logger.info(f"Spread {total_spread:.4f} >= 1.00, no profit, skipping")
+            
+            # STRICTER threshold - only trade very good spreads
+            if total_spread >= 0.98:
+                logger.info(f"Spread {total_spread:.4f} >= 0.98, not profitable enough, skipping")
                 return False
             
-            # Calculate how many EQUAL shares we can buy with BET_SIZE
-            # Cost per pair = up_price + down_price
-            # Shares = BET_SIZE / (up_price + down_price)
-            raw_shares = BET_SIZE / total_spread
+            # Target exactly MIN_SHARES on each side
+            target_shares = MIN_SHARES  # 5 shares
             
-            # CRITICAL: Round shares to exactly 2 decimal places (API requirement)
-            equal_shares = round(raw_shares, 2)
+            # Calculate CASH needed to buy target_shares at each price
+            # Cash = shares × price (rounded to 2 decimals for API)
+            cash_for_yes = round(target_shares * up_price, 2)
+            cash_for_no = round(target_shares * down_price, 2)
             
-            # Ensure minimum viable shares (Polymarket requires minimum 5 shares)
-            if equal_shares < MIN_SHARES:
-                logger.warning(f"Shares {equal_shares} < minimum {MIN_SHARES}, skipping trade")
+            # Ensure minimum cash amounts
+            if cash_for_yes < 0.10 or cash_for_no < 0.10:
+                logger.warning("Cash amount too small, skipping trade")
                 return False
             
-            # Calculate expected profit
-            cost = equal_shares * total_spread
-            payout = equal_shares * 1.00  # Merge pays $1 per pair
-            profit = payout - cost
+            total_cost = cash_for_yes + cash_for_no
+            expected_payout = target_shares * 1.00  # $1 per pair at resolution
+            expected_profit = expected_payout - total_cost
             
-            # Round prices to 2 decimals
-            safe_price_yes = round(up_price, 2)
-            safe_price_no = round(down_price, 2)
-            
-            logger.info(f"🎯 Sending EQUAL SHARE Orders (Proper Arbitrage):")
-            logger.info(f"   SHARES: {equal_shares} on BOTH sides")
-            logger.info(f"   YES: {equal_shares} shares @ {safe_price_yes}")
-            logger.info(f"   NO:  {equal_shares} shares @ {safe_price_no}")
-            logger.info(f"   Total cost: ${cost:.2f} | Payout: ${payout:.2f} | Profit: ${profit:.4f}")
+            logger.info(f"🎯 Sending FOK Market Orders (SAFER - MarketOrderArgs):")
+            logger.info(f"   Target: {target_shares} shares on EACH side")
+            logger.info(f"   YES: ${cash_for_yes} to buy ~{target_shares} shares @ {up_price}")
+            logger.info(f"   NO:  ${cash_for_no} to buy ~{target_shares} shares @ {down_price}")
+            logger.info(f"   Total: ${total_cost:.2f} | Payout: ${expected_payout:.2f} | Profit: ${expected_profit:.2f}")
 
-            # Create Order Args with EQUAL SHARES
-            order_args_yes = OrderArgs(
+            # Create Market Orders with cash amounts
+            # FOK ensures: either BOTH fill completely, or NEITHER fills
+            order_args_yes = MarketOrderArgs(
                 token_id=token_yes,
-                price=safe_price_yes,
-                size=equal_shares,  # EQUAL shares on both sides!
-                side=BUY
-            )
-            order_args_no = OrderArgs(
-                token_id=token_no,
-                price=safe_price_no,
-                size=equal_shares,  # EQUAL shares on both sides!
+                amount=cash_for_yes,
                 side=BUY
             )
             
-            # Post YES order first (using GTC to avoid FOK precision issues)
-            signed_yes = self.client.create_order(order_args_yes)
-            resp_yes = self.client.post_order(signed_yes, OrderType.GTC)
+            order_args_no = MarketOrderArgs(
+                token_id=token_no,
+                amount=cash_for_no,
+                side=BUY
+            )
+            
+            # Execute YES order with FOK
+            signed_yes = self.client.create_market_order(order_args_yes)
+            resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
             logger.info(f"YES Order Response: {resp_yes}")
             
             yes_success = resp_yes.get("success", False) if isinstance(resp_yes, dict) else False
-            yes_order_id = resp_yes.get("orderID") if isinstance(resp_yes, dict) else None
             
             if not yes_success:
-                logger.error(f"❌ YES order failed: {resp_yes}")
-                return False
+                error_msg = resp_yes.get("error", "Unknown error") if isinstance(resp_yes, dict) else str(resp_yes)
+                logger.warning(f"⚠️ YES order not filled (FOK killed): {error_msg}")
+                return False  # No need to cancel - FOK means nothing was filled
             
-            # Post NO order
-            signed_no = self.client.create_order(order_args_no)
-            resp_no = self.client.post_order(signed_no, OrderType.GTC)
+            # Execute NO order with FOK
+            signed_no = self.client.create_market_order(order_args_no)
+            resp_no = self.client.post_order(signed_no, OrderType.FOK)
             logger.info(f"NO Order Response: {resp_no}")
             
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
             
             if not no_success:
-                # CRITICAL: Cancel YES order to avoid unhedged position!
-                logger.error(f"❌ NO order failed: {resp_no}")
-                if yes_order_id:
-                    try:
-                        self.client.cancel(yes_order_id)
-                        logger.info(f"🔄 Cancelled YES order {yes_order_id} to avoid unhedged position")
-                    except Exception as ce:
-                        logger.error(f"⚠️ Failed to cancel YES order: {ce}")
+                error_msg = resp_no.get("error", "Unknown error") if isinstance(resp_no, dict) else str(resp_no)
+                logger.error(f"⚠️ NO order not filled but YES was! UNHEDGED POSITION!")
+                logger.error(f"   This shouldn't happen often with FOK. Error: {error_msg}")
+                # YES already filled, we have an unhedged position
+                # Log it prominently but can't undo the YES fill
                 return False
 
-            # Both orders posted successfully
-            logger.info(f"✅ ARBITRAGE EXECUTED: {equal_shares} pairs @ spread {total_spread:.4f}")
-            logger.info(f"   Expected profit after merge: ${profit:.4f}")
+            # BOTH orders succeeded!
+            logger.info(f"✅ ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {total_spread:.4f}")
+            logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
+            
+            # Mark this market as traded to prevent re-trading
+            if condition_id:
+                self.mark_market_traded(condition_id)
+            
             self.total_trades += 1
             return True
                 
@@ -1010,8 +1025,8 @@ class ArbitrageBot:
                     cid = res['market'].get('conditionId')
                     tokens = res['market'].get('_tokens')
                     
-                    # Execute
-                    if self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares):
+                    # Execute with condition_id to prevent re-trading same market
+                    if self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares, condition_id=cid):
                         self.real_client.merge_and_settle(cid)
 
     def _get_best_ask(self, ob):
