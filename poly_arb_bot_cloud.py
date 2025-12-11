@@ -280,14 +280,16 @@ class ArbitrageBot:
             bot_status['total_trades'] = self.real_client.total_trades
 
     def scan_markets(self):
+        """DEBUG VERSION: Using tag_id=21 (Crypto) to see what Railway returns"""
         try:
-            # Fetch ALL active markets (no tag filter) - filter client-side for crypto
+            # Try tag_id=21 (Crypto tag from /tags endpoint)
             resp = requests.get(
                 f"{GAMMA_API_URL}/markets",
                 params={
                     'active': 'true',
                     'closed': 'false',
-                    'limit': 500  # Fetch more to find all crypto markets
+                    'tag_id': 21,  # Crypto tag
+                    'limit': 200
                 },
                 timeout=15
             )
@@ -297,61 +299,59 @@ class ArbitrageBot:
                 return
             
             data = resp.json()
+            markets = data if isinstance(data, list) else data.get('markets', [])
             
-            # Safety check for list format
-            if isinstance(data, list):
-                markets = data
-            elif isinstance(data, dict) and 'markets' in data:
-                markets = data['markets']
-            else:
-                logger.warning(f"Unexpected response format: {type(data)}")
-                return
+            logger.info(f"📡 tag_id=21 returned {len(markets)} markets")
             
-            logger.info(f"📡 API returned {len(markets)} raw markets")
+            # Log first 5 market questions
+            logger.info("=== FIRST 5 MARKET QUESTIONS ===")
+            for i, m in enumerate(markets[:5]):
+                q = m.get('question', 'NO QUESTION')[:60]
+                logger.info(f"  {i+1}. {q}")
             
-            # DEBUG: Log first market structure
-            if markets:
-                first = markets[0]
-                logger.info(f"DEBUG First market keys: {list(first.keys())[:10]}")
-                logger.info(f"DEBUG First market question: {first.get('question', 'NO QUESTION FIELD')[:50]}")
-
-            found = []
-            filtered_stats = {'no_up_down': 0, 'no_crypto': 0, 'no_tokens': 0, 'closed': 0}
+            # Count markets with different keywords
+            up_down_count = 0
+            crypto_count = 0
+            both_count = 0
             
             for m in markets:
-                if m.get('closed') or not m.get('active', True): 
-                    filtered_stats['closed'] += 1
+                q = m.get('question', '').lower()
+                has_up_down = 'up or down' in q
+                has_crypto = any(kw in q for kw in ['bitcoin', 'ethereum', 'solana', 'xrp', 'btc', 'eth', 'sol'])
+                
+                if has_up_down: up_down_count += 1
+                if has_crypto: crypto_count += 1
+                if has_up_down and has_crypto: both_count += 1
+            
+            logger.info(f"📊 STATS: up_down={up_down_count}, crypto={crypto_count}, BOTH={both_count}")
+            
+            # Filter for crypto up/down markets
+            found = []
+            for m in markets:
+                if m.get('closed') or not m.get('active', True):
                     continue
                 
-                # Filter: Must contain "Up or Down" AND crypto keyword
                 q = m.get('question', '').lower()
                 if 'up or down' not in q:
-                    filtered_stats['no_up_down'] += 1
                     continue
                 if not any(kw in q for kw in CRYPTO_KEYWORDS):
-                    filtered_stats['no_crypto'] += 1
                     continue
                 
                 try:
                     clob_ids_str = m.get('clobTokenIds', '[]')
                     clob_ids = json.loads(clob_ids_str) if isinstance(clob_ids_str, str) else clob_ids_str
-                except: 
+                except:
                     clob_ids = []
                 
-                if not (clob_ids and len(clob_ids) >= 2):
-                    filtered_stats['no_tokens'] += 1
-                    continue
-                    
-                m['_tokens'] = clob_ids
-                found.append(m)
-            
-            logger.info(f"DEBUG Filter stats: {filtered_stats}")
+                if clob_ids and len(clob_ids) >= 2:
+                    m['_tokens'] = clob_ids
+                    found.append(m)
             
             self.target_markets = found
             self.last_scan_time = time.time()
             with status_lock:
                 bot_status['markets_count'] = len(found)
-            logger.info(f"🔍 Scanned: {len(found)} crypto Up/Down markets")
+            logger.info(f"🔍 Final: {len(found)} crypto Up/Down markets")
         except Exception as e:
             logger.error(f"Scan error: {e}")
 
