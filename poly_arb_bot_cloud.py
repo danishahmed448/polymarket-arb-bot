@@ -309,17 +309,28 @@ class ArbitrageBot:
                 return
             
             logger.info(f"📡 API returned {len(markets)} raw markets")
+            
+            # DEBUG: Log first market structure
+            if markets:
+                first = markets[0]
+                logger.info(f"DEBUG First market keys: {list(first.keys())[:10]}")
+                logger.info(f"DEBUG First market question: {first.get('question', 'NO QUESTION FIELD')[:50]}")
 
             found = []
+            filtered_stats = {'no_up_down': 0, 'no_crypto': 0, 'no_tokens': 0, 'closed': 0}
+            
             for m in markets:
                 if m.get('closed') or not m.get('active', True): 
+                    filtered_stats['closed'] += 1
                     continue
                 
                 # Filter: Must contain "Up or Down" AND crypto keyword
                 q = m.get('question', '').lower()
                 if 'up or down' not in q:
+                    filtered_stats['no_up_down'] += 1
                     continue
                 if not any(kw in q for kw in CRYPTO_KEYWORDS):
+                    filtered_stats['no_crypto'] += 1
                     continue
                 
                 try:
@@ -328,9 +339,14 @@ class ArbitrageBot:
                 except: 
                     clob_ids = []
                 
-                if clob_ids and len(clob_ids) >= 2:
-                    m['_tokens'] = clob_ids
-                    found.append(m)
+                if not (clob_ids and len(clob_ids) >= 2):
+                    filtered_stats['no_tokens'] += 1
+                    continue
+                    
+                m['_tokens'] = clob_ids
+                found.append(m)
+            
+            logger.info(f"DEBUG Filter stats: {filtered_stats}")
             
             self.target_markets = found
             self.last_scan_time = time.time()
