@@ -4,6 +4,7 @@ import os
 import requests
 import logging
 import threading
+import concurrent.futures
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
@@ -11,13 +12,18 @@ from py_clob_client.client import ClobClient
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0
 MIN_SPREAD_TARGET = 1.00
-POLL_INTERVAL = 2.0
-BET_SIZE = 10.0
+POLL_INTERVAL = 1.0           # Faster polling (was 2.0)
+BET_SIZE = 10.0               # Total budget for pair buy
 PROFIT_THRESHOLD = 0.001
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API_URL = "https://gamma-api.polymarket.com"
 TAG_15M = 102467
 WEB_PORT = int(os.environ.get('PORT', 8080))
+
+# Speed Optimization Settings
+MAX_WORKERS = 10              # Parallel order book fetches
+MAX_REQUESTS_PER_SECOND = 8   # Rate limit to avoid 429s
+PRIORITY_SPREAD_THRESHOLD = 1.02  # Prioritize markets with tight spreads
 
 # JSONbin.io Configuration (set as environment variables on Railway)
 JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', '')
@@ -45,6 +51,25 @@ bot_status = {
     'recent_checks': [],
     'running': True
 }
+
+
+class RateLimiter:
+    """Thread-safe rate limiter to avoid API 429 errors."""
+    def __init__(self, max_per_second=MAX_REQUESTS_PER_SECOND):
+        self.min_interval = 1.0 / max_per_second
+        self.last_call = 0
+        self.lock = threading.Lock()
+    
+    def wait(self):
+        with self.lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self.last_call = time.time()
+
+# Global rate limiter for CLOB API
+clob_rate_limiter = RateLimiter(max_per_second=MAX_REQUESTS_PER_SECOND)
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -366,13 +391,24 @@ class ArbitrageBot:
             logger.error(f"Scan error: {e}")
 
     def check_for_arbitrage(self):
-        for market in self.target_markets:
+        # Sort markets by last known spread (prioritize tight spreads)
+        sorted_markets = sorted(
+            self.target_markets,
+            key=lambda m: m.get('_last_spread', 1.02)
+        )
+        
+        for market in sorted_markets:
             try:
                 tokens = market.get('_tokens', [])
                 if len(tokens) < 2:
                     continue
+                
+                # Rate limit API calls to avoid 429
+                clob_rate_limiter.wait()
                 ob_up = self.clob_client.get_order_book(tokens[0])
+                clob_rate_limiter.wait()
                 ob_down = self.clob_client.get_order_book(tokens[1])
+                
                 ask_up = self._get_best_ask(ob_up)
                 ask_down = self._get_best_ask(ob_down)
                 if ask_up is None or ask_down is None:
@@ -380,6 +416,9 @@ class ArbitrageBot:
 
                 total = ask_up + ask_down
                 q = market.get('question', '')[:35]
+                
+                # Store last spread for smart prioritization
+                market['_last_spread'] = total
                 
                 # Thread-safe updates - all bot_status writes inside lock
                 with status_lock:
@@ -389,6 +428,7 @@ class ArbitrageBot:
                     bot_status['recent_checks'].append({'q': q, 'up': ask_up, 'down': ask_down, 'total': total})
                     if len(bot_status['recent_checks']) > 10:
                         bot_status['recent_checks'].pop(0)
+
 
                 if total < MIN_SPREAD_TARGET:
                     profit = 1.00 - total
