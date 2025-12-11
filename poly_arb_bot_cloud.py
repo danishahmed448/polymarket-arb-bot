@@ -9,7 +9,7 @@ import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds
+from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
@@ -171,77 +171,83 @@ class RealMoneyClient:
     def __init__(self):
         self.host = "https://clob.polymarket.com"
         self.key = os.environ.get("PRIVATE_KEY") 
-        self.chain_id = 137 # Hardcoded to Polygon Mainnet (Safer)
+        self.funder = os.environ.get("FUNDER_ADDRESS")
+        self.chain_id = 137  # Polygon Mainnet
         self.total_trades = 0
         self.balance = 0.0
-        self.client = None  # Initialize to None first
+        self.client = None
         
         # Log env var status for debugging
         logger.info(f"🔑 PRIVATE_KEY set: {bool(self.key)}")
-        logger.info(f"🔑 FUNDER_ADDRESS set: {bool(os.environ.get('FUNDER_ADDRESS'))}")
-        logger.info(f"🔑 POLY_API_KEY set: {bool(os.environ.get('POLY_API_KEY'))}")
+        logger.info(f"🔑 FUNDER_ADDRESS set: {bool(self.funder)}")
         
         try:
-            # Build API credentials object
-            creds = ApiCreds(
-                api_key=os.environ.get("POLY_API_KEY"),
-                api_secret=os.environ.get("POLY_API_SECRET"),
-                api_passphrase=os.environ.get("POLY_API_PASSPHRASE")
-            )
-            
+            # Initialize client (following official docs)
             self.client = ClobClient(
                 self.host,
                 key=self.key,
                 chain_id=self.chain_id,
-                signature_type=2, 
-                funder=os.environ.get("FUNDER_ADDRESS"),
-                creds=creds  # Use creds object instead of individual params
+                signature_type=0,  # 0 for EOA/MetaMask wallets
+                funder=self.funder
             )
+            
+            # Derive API credentials automatically (official method)
+            self.client.set_api_creds(self.client.create_or_derive_api_creds())
             logger.info("✅ Connected to Polymarket CLOB Client (Real Money)")
+            
         except Exception as e:
             logger.error(f"❌ Failed to connect to CLOB: {e}")
-            self.client = None  # Ensure it's None on failure
+            self.client = None
         
         self.update_balance()
 
     def update_balance(self):
-        # We assume $100 for dashboard purposes to save API calls
-        self.balance = 100.0 
+        self.balance = 100.0  # Placeholder for dashboard
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares):
-        # Safety: Skip if client failed to initialize
         if self.client is None:
-            logger.error("❌ Cannot trade: CLOB Client not connected. Check your env vars!")
+            logger.error("❌ Cannot trade: CLOB Client not connected!")
             return False
             
         token_yes = tokens[0]
         token_no = tokens[1]
+        
         try:
-            # 1. Buy YES shares (FOK)
-            order_yes = self.client.create_order(
-                token_id=token_yes, price=up_price, size=shares, side=BUY, order_type="FOK"
+            # Create orders using OrderArgs (official method)
+            order_args_yes = OrderArgs(
+                token_id=token_yes,
+                price=up_price,
+                size=shares,
+                side=BUY
             )
-            # 2. Buy NO shares (FOK)
-            order_no = self.client.create_order(
-                token_id=token_no, price=down_price, size=shares, side=BUY, order_type="FOK"
+            order_args_no = OrderArgs(
+                token_id=token_no,
+                price=down_price,
+                size=shares,
+                side=BUY
             )
-
-            # Post orders
-            resp_yes = self.client.post_order(order_yes)
-            resp_no = self.client.post_order(order_no)
             
-            yes_success = resp_yes.get("success", False)
-            no_success = resp_no.get("success", False)
+            # Sign and post orders with FOK type
+            signed_yes = self.client.create_order(order_args_yes)
+            resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
+            logger.info(f"YES Order Response: {resp_yes}")
+            
+            signed_no = self.client.create_order(order_args_no)
+            resp_no = self.client.post_order(signed_no, OrderType.FOK)
+            logger.info(f"NO Order Response: {resp_no}")
+            
+            # Check success
+            yes_success = resp_yes.get("success", False) if isinstance(resp_yes, dict) else False
+            no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
 
             if yes_success and no_success:
                 logger.info(f"✅ REAL TRADE EXECUTED: Bought {shares} shares.")
                 self.total_trades += 1
                 return True
             else:
-                logger.error(f"❌ Trade Failed/Partial. Yes:{yes_success} No:{no_success}")
-                logger.error(f"Resp YES: {resp_yes}")
-                logger.error(f"Resp NO: {resp_no}")
+                logger.error(f"❌ Trade Failed. Yes:{yes_success} No:{no_success}")
                 return False
+                
         except Exception as e:
             logger.error(f"Real Trade Exception: {e}")
             return False
