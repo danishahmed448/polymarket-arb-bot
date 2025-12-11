@@ -19,7 +19,10 @@ GAMMA_API_URL = "https://gamma-api.polymarket.com"
 TAG_15M = 102467
 WEB_PORT = int(os.environ.get('PORT', 8080))
 
-STATE_FILE = "bot_state.json"
+# JSONbin.io Configuration (set as environment variables on Railway)
+JSONBIN_API_KEY = os.environ.get('JSONBIN_API_KEY', 'YOUR_X_MASTER_KEY_HERE')
+JSONBIN_BIN_ID = os.environ.get('JSONBIN_BIN_ID', 'YOUR_BIN_ID_HERE')
+JSONBIN_URL = f"https://api.jsonbin.io/v3/b/{JSONBIN_BIN_ID}"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
@@ -39,174 +42,219 @@ bot_status = {
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
-    """Simple web dashboard"""
-    
     def log_message(self, format, *args):
-        pass  # Suppress HTTP logs
+        pass
     
     def do_GET(self):
         if self.path == '/api/status':
             self.send_response(200)
-            self.send_header('Content-type', 'application/json')
+            self.send_header('Content-type', 'application/json; charset=utf-8')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(bot_status).encode())
+            self.wfile.write(json.dumps(bot_status).encode('utf-8'))
         else:
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(self.get_dashboard_html().encode())
+            self.wfile.write(self.get_dashboard_html().encode('utf-8'))
     
     def get_dashboard_html(self):
         profit = bot_status['balance'] - bot_status['initial_balance']
         profit_pct = (profit / bot_status['initial_balance']) * 100 if bot_status['initial_balance'] > 0 else 0
-        profit_color = '#22c55e' if profit >= 0 else '#ef4444'
+        profit_color = '#10b981' if profit >= 0 else '#ef4444'
+        profit_icon = 'trending_up' if profit >= 0 else 'trending_down'
         
         recent_html = ''
-        for check in bot_status.get('recent_checks', [])[-8:]:
+        for i, check in enumerate(reversed(bot_status.get('recent_checks', [])[-8:])):
             total = check.get('total', 1.02)
             if total < 1.00:
-                icon, color = '🔥', '#22c55e'
+                badge_class, badge_text = 'badge-green', 'ARB'
             elif total < 1.01:
-                icon, color = '💰', '#eab308'
+                badge_class, badge_text = 'badge-yellow', 'CLOSE'
             elif total <= 1.02:
-                icon, color = '⚡', '#06b6d4'
+                badge_class, badge_text = 'badge-blue', 'OK'
             else:
-                icon, color = '·', '#6b7280'
+                badge_class, badge_text = 'badge-gray', '-'
+            
+            coin = 'BTC' if 'Bitcoin' in check.get('q', '') else 'ETH' if 'Ethereum' in check.get('q', '') else 'SOL' if 'Solana' in check.get('q', '') else 'XRP'
             recent_html += f'''
-            <div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #374151;">
-                <span>{icon} {check.get('q', 'Unknown')[:35]}</span>
-                <span style="color:{color};font-weight:bold;">{total:.4f}</span>
+            <div class="check-row" style="animation-delay: {i * 0.05}s">
+                <div class="check-left">
+                    <span class="coin-badge">{coin}</span>
+                    <span class="check-name">{check.get('q', 'Unknown')[:30]}</span>
+                </div>
+                <div class="check-right">
+                    <span class="check-spread">{total:.4f}</span>
+                    <span class="{badge_class}">{badge_text}</span>
+                </div>
             </div>'''
         
         return f'''<!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Polymarket Arbitrage Bot</title>
+    <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="10">
+    <title>Polymarket Bot</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons+Round" rel="stylesheet">
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{ 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-            color: #e5e7eb;
+            font-family: 'Inter', -apple-system, sans-serif;
+            background: #0a0a0f;
+            color: #fff;
             min-height: 100vh;
-            padding: 20px;
         }}
-        .container {{ max-width: 800px; margin: 0 auto; }}
-        .header {{ 
-            text-align: center; 
-            padding: 30px 0;
-            border-bottom: 1px solid #374151;
-            margin-bottom: 30px;
+        .bg-gradient {{
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: radial-gradient(ellipse at top, #1a1a3e 0%, #0a0a0f 50%),
+                        radial-gradient(ellipse at bottom right, #0f172a 0%, transparent 50%);
+            z-index: -1;
         }}
-        .header h1 {{ font-size: 28px; margin-bottom: 10px; }}
-        .header .subtitle {{ color: #9ca3af; }}
-        .stats {{ 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-            margin-bottom: 30px;
-        }}
-        .stat {{ 
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 20px;
-            text-align: center;
-        }}
-        .stat-value {{ font-size: 28px; font-weight: bold; }}
-        .stat-label {{ color: #9ca3af; font-size: 14px; margin-top: 5px; }}
-        .section {{ 
-            background: rgba(255,255,255,0.03);
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-        }}
-        .section h2 {{ margin-bottom: 15px; font-size: 18px; }}
-        .status-dot {{ 
-            display: inline-block;
-            width: 10px; height: 10px;
-            background: #22c55e;
-            border-radius: 50%;
-            margin-right: 8px;
-            animation: pulse 2s infinite;
-        }}
-        @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
-        .footer {{ text-align: center; color: #6b7280; margin-top: 30px; font-size: 14px; }}
+        .container {{ max-width: 900px; margin: 0 auto; padding: 24px; }}
+        
+        /* Header */
+        .header {{ text-align: center; padding: 40px 0 30px; }}
+        .header h1 {{ font-size: 32px; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, #fff 0%, #94a3b8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }}
+        .status-badge {{ display: inline-flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); padding: 8px 16px; border-radius: 100px; font-size: 13px; color: #10b981; }}
+        .pulse {{ width: 8px; height: 8px; background: #10b981; border-radius: 50%; animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0%, 100% {{ opacity: 1; transform: scale(1); }} 50% {{ opacity: 0.5; transform: scale(0.9); }} }}
+        
+        /* Stats Grid */
+        .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin: 30px 0; }}
+        @media (max-width: 600px) {{ .stats {{ grid-template-columns: repeat(2, 1fr); }} }}
+        .stat {{ background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.06); border-radius: 16px; padding: 24px; text-align: center; transition: all 0.3s; }}
+        .stat:hover {{ background: rgba(255,255,255,0.05); transform: translateY(-2px); }}
+        .stat-icon {{ width: 40px; height: 40px; border-radius: 12px; display: flex; align-items: center; justify-content: center; margin: 0 auto 12px; }}
+        .stat-icon .material-icons-round {{ font-size: 22px; }}
+        .stat-value {{ font-size: 28px; font-weight: 700; margin-bottom: 4px; }}
+        .stat-label {{ font-size: 13px; color: #64748b; font-weight: 500; }}
+        
+        /* Card */
+        .card {{ background: rgba(255,255,255,0.02); backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 24px; margin-bottom: 20px; }}
+        .card-header {{ display: flex; align-items: center; gap: 10px; margin-bottom: 20px; }}
+        .card-header h2 {{ font-size: 16px; font-weight: 600; color: #e2e8f0; }}
+        .card-header .material-icons-round {{ font-size: 20px; color: #64748b; }}
+        
+        /* Check Rows */
+        .check-row {{ display: flex; justify-content: space-between; align-items: center; padding: 14px 0; border-bottom: 1px solid rgba(255,255,255,0.04); animation: fadeIn 0.3s ease; }}
+        .check-row:last-child {{ border-bottom: none; }}
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateX(-10px); }} to {{ opacity: 1; transform: translateX(0); }} }}
+        .check-left {{ display: flex; align-items: center; gap: 12px; }}
+        .check-right {{ display: flex; align-items: center; gap: 12px; }}
+        .coin-badge {{ background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%); padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        .check-name {{ color: #94a3b8; font-size: 14px; }}
+        .check-spread {{ font-family: 'SF Mono', monospace; font-size: 15px; font-weight: 600; }}
+        
+        /* Badges */
+        .badge-green {{ background: rgba(16, 185, 129, 0.15); color: #10b981; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        .badge-yellow {{ background: rgba(234, 179, 8, 0.15); color: #eab308; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        .badge-blue {{ background: rgba(59, 130, 246, 0.15); color: #3b82f6; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        .badge-gray {{ background: rgba(100, 116, 139, 0.15); color: #64748b; padding: 4px 10px; border-radius: 6px; font-size: 11px; font-weight: 600; }}
+        
+        /* Footer */
+        .footer {{ text-align: center; padding: 30px; color: #475569; font-size: 13px; }}
+        .footer a {{ color: #3b82f6; text-decoration: none; }}
     </style>
+    <script>setTimeout(() => location.reload(), 10000);</script>
 </head>
 <body>
+    <div class="bg-gradient"></div>
     <div class="container">
         <div class="header">
-            <h1>📈 Polymarket Arbitrage Bot</h1>
-            <p class="subtitle"><span class="status-dot"></span>Running on Railway</p>
+            <h1>Polymarket Arbitrage Bot</h1>
+            <div class="status-badge"><span class="pulse"></span> Running 24/7 on Cloud</div>
         </div>
         
         <div class="stats">
             <div class="stat">
-                <div class="stat-value" style="color:#22c55e;">${bot_status['balance']:.2f}</div>
+                <div class="stat-icon" style="background: rgba(16, 185, 129, 0.15);"><span class="material-icons-round" style="color: #10b981;">account_balance_wallet</span></div>
+                <div class="stat-value" style="color: #10b981;">${bot_status['balance']:.2f}</div>
                 <div class="stat-label">Balance</div>
             </div>
             <div class="stat">
-                <div class="stat-value" style="color:{profit_color};">${profit:+.2f}</div>
+                <div class="stat-icon" style="background: rgba({('16, 185, 129' if profit >= 0 else '239, 68, 68')}, 0.15);"><span class="material-icons-round" style="color: {profit_color};">{profit_icon}</span></div>
+                <div class="stat-value" style="color: {profit_color};">${profit:+.2f}</div>
                 <div class="stat-label">Profit ({profit_pct:+.1f}%)</div>
             </div>
             <div class="stat">
+                <div class="stat-icon" style="background: rgba(139, 92, 246, 0.15);"><span class="material-icons-round" style="color: #8b5cf6;">swap_horiz</span></div>
                 <div class="stat-value">{bot_status['total_trades']}</div>
-                <div class="stat-label">Total Trades</div>
+                <div class="stat-label">Trades</div>
             </div>
             <div class="stat">
+                <div class="stat-icon" style="background: rgba(59, 130, 246, 0.15);"><span class="material-icons-round" style="color: #3b82f6;">speed</span></div>
                 <div class="stat-value">{bot_status['best_spread']:.4f}</div>
                 <div class="stat-label">Best Spread</div>
             </div>
         </div>
         
-        <div class="section">
-            <h2>📊 Recent Market Checks</h2>
-            {recent_html if recent_html else '<p style="color:#6b7280;">Waiting for data...</p>'}
+        <div class="card">
+            <div class="card-header"><span class="material-icons-round">monitoring</span><h2>Live Market Checks</h2></div>
+            {recent_html if recent_html else '<p style="color:#64748b;text-align:center;padding:20px;">Waiting for market data...</p>'}
         </div>
         
-        <div class="section">
-            <h2>ℹ️ Stats</h2>
-            <p>Markets Monitored: <strong>{bot_status['markets_count']}</strong></p>
-            <p>Total Checks: <strong>{bot_status['checks']}</strong></p>
-            <p>Last Update: <strong>{bot_status['last_update']}</strong></p>
+        <div class="card">
+            <div class="card-header"><span class="material-icons-round">info</span><h2>Bot Statistics</h2></div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:20px;text-align:center;">
+                <div><div style="font-size:24px;font-weight:600;">{bot_status['markets_count']}</div><div style="color:#64748b;font-size:13px;">Markets</div></div>
+                <div><div style="font-size:24px;font-weight:600;">{bot_status['checks']}</div><div style="color:#64748b;font-size:13px;">Total Checks</div></div>
+                <div><div style="font-size:24px;font-weight:600;">{bot_status['last_update']}</div><div style="color:#64748b;font-size:13px;">Last Update</div></div>
+            </div>
         </div>
         
-        <div class="footer">
-            Auto-refreshes every 10 seconds • <a href="/api/status" style="color:#06b6d4;">API</a>
-        </div>
+        <div class="footer">Auto-refreshes every 10 seconds &bull; <a href="/api/status">View API</a></div>
     </div>
 </body>
 </html>'''
 
 
-class PersistentMockClient:
+
+class CloudPersistentClient:
+    """Paper Trading Client with JSONbin.io cloud persistence."""
+    
     def __init__(self, initial_balance=1000.0):
         self.balance = initial_balance
         self.positions = {}
-        self.trade_history = []
         self.total_trades = 0
-        self._load_state()
+        self._load_from_cloud()
 
-    def _load_state(self):
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, 'r') as f:
-                    state = json.load(f)
-                self.balance = state.get('balance', self.balance)
-                self.total_trades = state.get('total_trades', 0)
-                logger.info(f"📂 Restored: Balance=${self.balance:.2f}, Trades={self.total_trades}")
-            except:
-                pass
-
-    def _save_state(self):
+    def _load_from_cloud(self):
+        """Load state from JSONbin.io"""
         try:
-            with open(STATE_FILE, 'w') as f:
-                json.dump({'balance': self.balance, 'total_trades': self.total_trades, 'updated': datetime.now().isoformat()}, f)
-        except:
-            pass
+            headers = {'X-Master-Key': JSONBIN_API_KEY}
+            resp = requests.get(JSONBIN_URL, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                record = data.get('record', {})
+                self.balance = record.get('balance', self.balance)
+                self.total_trades = record.get('total_trades', 0)
+                logger.info(f"☁️ Loaded from cloud: Balance=${self.balance:.2f}, Trades={self.total_trades}")
+            else:
+                logger.warning(f"Could not load from JSONbin: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Cloud load error: {e}")
+
+    def _save_to_cloud(self):
+        """Save state to JSONbin.io"""
+        try:
+            headers = {
+                'X-Master-Key': JSONBIN_API_KEY,
+                'Content-Type': 'application/json'
+            }
+            data = {
+                'balance': self.balance,
+                'total_trades': self.total_trades,
+                'last_updated': datetime.now().isoformat()
+            }
+            resp = requests.put(JSONBIN_URL, headers=headers, json=data, timeout=10)
+            if resp.status_code == 200:
+                logger.info(f"☁️ Saved to cloud: Balance=${self.balance:.2f}")
+            else:
+                logger.warning(f"Cloud save failed: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"Cloud save error: {e}")
 
     def buy(self, market_id, outcome, price, size_shares):
         cost = price * size_shares
@@ -230,15 +278,16 @@ class PersistentMockClient:
             self.balance += mergeable * 1.00
             self.total_trades += 1
             logger.info(f"💎 SETTLED | Balance: ${self.balance:.2f}")
-            self._save_state()
+            self._save_to_cloud()  # Save after each trade!
 
 
 class ArbitrageBot:
     def __init__(self):
         self.clob_client = ClobClient(host=CLOB_HOST, key=None, chain_id=137)
-        self.mock_client = PersistentMockClient(initial_balance=INITIAL_BALANCE)
+        self.mock_client = CloudPersistentClient(initial_balance=INITIAL_BALANCE)
         self.target_markets = []
         self.last_scan_time = 0
+        self.last_cloud_save = 0
 
     def scan_markets(self):
         try:
@@ -318,10 +367,10 @@ class ArbitrageBot:
         bot_status['last_update'] = datetime.now().strftime('%H:%M:%S')
 
     def run(self):
-        logger.info("🚀 Starting Polymarket Bot with Web Dashboard")
+        logger.info("🚀 Starting Polymarket Bot with Cloud Persistence")
         logger.info(f"📊 Dashboard: http://localhost:{WEB_PORT}")
+        logger.info(f"☁️ State: JSONbin.io")
         
-        # Start web server in background
         server = HTTPServer(('0.0.0.0', WEB_PORT), DashboardHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         
@@ -331,12 +380,18 @@ class ArbitrageBot:
             try:
                 if time.time() - self.last_scan_time > 60:
                     self.scan_markets()
+                
+                # Periodic cloud save every 5 minutes
+                if time.time() - self.last_cloud_save > 300:
+                    self.mock_client._save_to_cloud()
+                    self.last_cloud_save = time.time()
+                
                 self.check_for_arbitrage()
                 self.update_status()
                 time.sleep(POLL_INTERVAL)
             except KeyboardInterrupt:
                 logger.info("🛑 Stopping...")
-                self.mock_client._save_state()
+                self.mock_client._save_to_cloud()
                 break
             except Exception as e:
                 logger.error(f"Error: {e}")
