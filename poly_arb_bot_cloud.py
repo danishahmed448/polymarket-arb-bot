@@ -9,7 +9,7 @@ import html  # Added for dashboard security
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
 
 # --- Configuration ---
@@ -213,32 +213,27 @@ class RealMoneyClient:
         token_no = tokens[1]
         
         try:
-            # Round to API precision limits (per GitHub issue #121)
-            # For tick_size=0.01: price=2 decimals, size=2 decimals
-            up_price_rounded = round(up_price, 2)
-            down_price_rounded = round(down_price, 2)
-            shares_rounded = round(shares, 2)
+            # Calculate dollar amount for each side (half of bet size each)
+            amount_per_side = round(BET_SIZE / 2, 2)
             
-            # Create orders using OrderArgs (official method)
-            order_args_yes = OrderArgs(
+            # Use MarketOrderArgs with dollar amount (official FOK method)
+            order_args_yes = MarketOrderArgs(
                 token_id=token_yes,
-                price=up_price_rounded,
-                size=shares_rounded,
+                amount=amount_per_side,
                 side=BUY
             )
-            order_args_no = OrderArgs(
+            order_args_no = MarketOrderArgs(
                 token_id=token_no,
-                price=down_price_rounded,
-                size=shares_rounded,
+                amount=amount_per_side,
                 side=BUY
             )
             
-            # Sign and post orders with FOK type
-            signed_yes = self.client.create_order(order_args_yes)
+            # Create and post market orders with FOK
+            signed_yes = self.client.create_market_order(order_args_yes)
             resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
             logger.info(f"YES Order Response: {resp_yes}")
             
-            signed_no = self.client.create_order(order_args_no)
+            signed_no = self.client.create_market_order(order_args_no)
             resp_no = self.client.post_order(signed_no, OrderType.FOK)
             logger.info(f"NO Order Response: {resp_no}")
             
@@ -247,7 +242,7 @@ class RealMoneyClient:
             no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
 
             if yes_success and no_success:
-                logger.info(f"✅ REAL TRADE EXECUTED: Bought {shares} shares.")
+                logger.info(f"✅ REAL TRADE EXECUTED: ${amount_per_side} on each side.")
                 self.total_trades += 1
                 return True
             else:
