@@ -706,8 +706,8 @@ class RealMoneyClient:
             total_spread = up_price + down_price
             
             # STRICTER threshold - only trade very good spreads
-            if total_spread >= 0.98:
-                logger.info(f"Spread {total_spread:.4f} >= 0.98, not profitable enough, skipping")
+            if total_spread >= MIN_SPREAD_TARGET:
+                logger.info(f"Spread {total_spread:.4f} >= {MIN_SPREAD_TARGET}, not profitable enough, skipping")
                 return False
             
             # PRE-TRADE LIQUIDITY CHECK: Ensure we can exit if needed
