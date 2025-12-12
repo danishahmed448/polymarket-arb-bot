@@ -97,8 +97,8 @@ def detect_coin(text):
 
 
 def is_market_live(market, event):
-    """Check if market is currently live (not closed, not past end date)."""
-    from datetime import datetime, timezone
+    """Check if market is currently live (not closed, not past end date, has enough time remaining)."""
+    from datetime import datetime, timezone, timedelta
     
     if market.get('closed') == True:
         return False
@@ -113,8 +113,17 @@ def is_market_live(market, event):
                     end_dt = datetime.fromisoformat(end_date)
                 
                 now = datetime.now(timezone.utc)
+                
+                # Market already ended
                 if end_dt < now:
                     return False
+                
+                # IMPROVEMENT: Require at least 30 minutes remaining
+                # Markets near expiry have unreliable order books
+                min_time_remaining = timedelta(minutes=30)
+                if end_dt - now < min_time_remaining:
+                    return False
+                    
         except:
             pass
     
@@ -770,6 +779,15 @@ class RealMoneyClient:
                 yes_ask_liquidity = get_liquidity(ob_yes, 'asks')
                 no_ask_liquidity = get_liquidity(ob_no, 'asks')
                 
+                # IMPROVEMENT: Zero asks = market is resolved, skip immediately
+                if yes_ask_liquidity == 0:
+                    logger.warning(f"⚠️ ZERO asks on YES side - market likely resolved, skipping")
+                    return False
+                
+                if no_ask_liquidity == 0:
+                    logger.warning(f"⚠️ ZERO asks on NO side - market likely resolved, skipping")
+                    return False
+                
                 min_buy_liquidity = BET_SIZE * 0.8  # Need 80% of bet size in asks to buy
                 
                 if yes_ask_liquidity < min_buy_liquidity:
@@ -1152,8 +1170,11 @@ class ArbitrageBot:
                             # Reorder tokens so [0] is always YES/UP and [1] is always NO/DOWN
                             if len(tokens) >= 2 and yes_idx < len(tokens) and no_idx < len(tokens):
                                 ordered_tokens = [tokens[yes_idx], tokens[no_idx]]
+                                if outcomes:
+                                    logger.info(f"Token ordering: outcomes={outcomes}, yes_idx={yes_idx}, no_idx={no_idx}")
                             else:
                                 ordered_tokens = tokens[:2]
+                                logger.warning(f"Using default token order - outcomes={outcomes}")
                             
                             # Add market with metadata
                             m['_tokens'] = ordered_tokens
