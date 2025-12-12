@@ -38,11 +38,15 @@ RPC_URL = os.environ.get('RPC_URL', 'https://polygon-rpc.com/')
 
 # --- SCAN MODE TOGGLE ---
 # 'CRYPTO_ONLY' = Only scan crypto Up/Down markets (15m, 1H, 4H, Daily) - 16 markets
-# 'ALL_BINARY'  = Scan ALL binary markets on Polymarket - 100+ markets
-SCAN_MODE = 'ALL_BINARY'  # Change to 'CRYPTO_ONLY' to scan only crypto markets
+# 'ALL_BINARY'  = Scan ALL binary markets on Polymarket - 300+ markets
+SCAN_MODE = 'ALL_BINARY'  # Starting mode (will auto-switch if enabled)
+
+# AUTO-SWITCH: Toggle between modes every hour
+AUTO_SWITCH_MODE = True   # Set to False to disable auto-switching
+MODE_SWITCH_INTERVAL = 3600  # Switch every 3600 seconds (1 hour)
 
 # Maximum markets to scan in ALL_BINARY mode
-ALL_BINARY_MARKET_LIMIT = 100
+ALL_BINARY_MARKET_LIMIT = 300
 
 # --- Multi-Timeframe Configuration (for CRYPTO_ONLY mode) ---
 # Discovered from Polymarket API (Chrome Network Tab)
@@ -132,7 +136,9 @@ bot_status = {
     'checks': 0,
     'last_update': '',
     'recent_checks': [],
-    'running': True
+    'running': True,
+    'current_mode': SCAN_MODE,  # Track current scan mode
+    'last_mode_switch': 0,      # Timestamp of last mode switch
 }
 
 class RateLimiter:
@@ -1086,6 +1092,31 @@ class ArbitrageBot:
             self.real_client.update_balance()
             
             found = []
+            
+            # === AUTO-SWITCH MODE LOGIC ===
+            global SCAN_MODE
+            if AUTO_SWITCH_MODE:
+                current_time = time.time()
+                with status_lock:
+                    last_switch = bot_status.get('last_mode_switch', 0)
+                    
+                    # Initialize on first run
+                    if last_switch == 0:
+                        bot_status['last_mode_switch'] = current_time
+                        bot_status['current_mode'] = SCAN_MODE
+                        logger.info(f"🔄 Mode switching enabled (every {MODE_SWITCH_INTERVAL}s). Starting in {SCAN_MODE} mode")
+                    
+                    # Check if it's time to switch
+                    elif current_time - last_switch >= MODE_SWITCH_INTERVAL:
+                        # Toggle mode
+                        if SCAN_MODE == 'ALL_BINARY':
+                            SCAN_MODE = 'CRYPTO_ONLY'
+                        else:
+                            SCAN_MODE = 'ALL_BINARY'
+                        
+                        bot_status['last_mode_switch'] = current_time
+                        bot_status['current_mode'] = SCAN_MODE
+                        logger.info(f"🔁 MODE SWITCHED to {SCAN_MODE}")
             
             # === ALL_BINARY MODE: Scan all binary markets on Polymarket ===
             if SCAN_MODE == 'ALL_BINARY':
