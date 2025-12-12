@@ -1130,8 +1130,33 @@ class ArbitrageBot:
                             if len(tokens) < 2:
                                 continue
                             
+                            # CRITICAL FIX: Use outcomes field to correctly map tokens to YES/NO
+                            # outcomes array corresponds to clobTokenIds array in order
+                            outcomes = m.get('outcomes', [])
+                            if isinstance(outcomes, str):
+                                try:
+                                    outcomes = json.loads(outcomes)
+                                except:
+                                    outcomes = []
+                            
+                            # Find indices for UP/YES and DOWN/NO
+                            yes_idx = 0  # default
+                            no_idx = 1   # default
+                            for i, outcome in enumerate(outcomes):
+                                outcome_lower = str(outcome).lower()
+                                if 'yes' in outcome_lower or 'up' in outcome_lower:
+                                    yes_idx = i
+                                elif 'no' in outcome_lower or 'down' in outcome_lower:
+                                    no_idx = i
+                            
+                            # Reorder tokens so [0] is always YES/UP and [1] is always NO/DOWN
+                            if len(tokens) >= 2 and yes_idx < len(tokens) and no_idx < len(tokens):
+                                ordered_tokens = [tokens[yes_idx], tokens[no_idx]]
+                            else:
+                                ordered_tokens = tokens[:2]
+                            
                             # Add market with metadata
-                            m['_tokens'] = tokens
+                            m['_tokens'] = ordered_tokens
                             m['_timeframe'] = timeframe
                             m['_event_slug'] = slug
                             m['_coin'] = coin
