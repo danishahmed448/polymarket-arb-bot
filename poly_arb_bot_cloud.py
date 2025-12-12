@@ -97,35 +97,10 @@ def detect_coin(text):
 
 
 def is_market_live(market, event):
-    """Check if market is currently live (not closed, not past end date, has enough time remaining)."""
-    from datetime import datetime, timezone, timedelta
-    
+    """Check if market is currently live (trusting API filtering, only check closed flag)."""
+    # Only check if explicitly closed - trust the API's closed=false filter
     if market.get('closed') == True:
         return False
-    
-    end_date = market.get('endDate') or market.get('end_date_iso') or event.get('endDate')
-    if end_date:
-        try:
-            if isinstance(end_date, str):
-                if end_date.endswith('Z'):
-                    end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-                else:
-                    end_dt = datetime.fromisoformat(end_date)
-                
-                now = datetime.now(timezone.utc)
-                
-                # Market already ended
-                if end_dt < now:
-                    return False
-                
-                # IMPROVEMENT: Require at least 30 minutes remaining
-                # Markets near expiry have unreliable order books
-                min_time_remaining = timedelta(minutes=30)
-                if end_dt - now < min_time_remaining:
-                    return False
-                    
-        except:
-            pass
     
     return True
 
@@ -1370,28 +1345,32 @@ class ArbitrageBot:
             valid_asks = [a for a in asks if parse_price(a) > 0 and parse_size(a) > 0]
             valid_asks.sort(key=parse_price)
 
-            needed_cash = BET_SIZE / 2
+            # FIXED: Check liquidity for MIN_SHARES (the actual trading amount)
+            # Previously checked BET_SIZE/2 which was a mismatch with trade size
+            needed_shares = MIN_SHARES  # We buy exactly MIN_SHARES on each side
             total_shares = 0
             total_cost = 0
             
             for ask in valid_asks:
                 price = parse_price(ask)
                 size = parse_size(ask)
-                liquidity_value = price * size
                 
-                if total_cost + liquidity_value >= needed_cash:
-                    remaining_cash = needed_cash - total_cost
-                    shares_to_buy = remaining_cash / price
-                    total_shares += shares_to_buy
-                    total_cost += remaining_cash
+                shares_available = min(size, needed_shares - total_shares)
+                cost_for_shares = price * shares_available
+                
+                total_shares += shares_available
+                total_cost += cost_for_shares
+                
+                if total_shares >= needed_shares:
                     break
-                else:
-                    total_shares += size
-                    total_cost += liquidity_value
 
-            if total_cost < needed_cash * 0.9: return None
-            if total_shares == 0: return None
+            # Not enough shares in order book
+            if total_shares < needed_shares * 0.9:
+                return None
+            if total_shares == 0:
+                return None
             
+            # Return volume-weighted average price for the shares we'd buy
             return total_cost / total_shares
 
         except Exception:
