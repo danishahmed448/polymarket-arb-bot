@@ -20,7 +20,7 @@ from abi.safe_abi import safe_abi
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
-MIN_SPREAD_TARGET = 0.98       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
+MIN_SPREAD_TARGET = 0.99       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
 BET_SIZE = 5.0                # Must be at least $5 to meet minimum 5 share requirement
 MIN_SHARES = 5.0              # Polymarket minimum order size
@@ -1543,3 +1543,4 @@ class ArbitrageBot:
 if __name__ == "__main__":
     bot = ArbitrageBot()
     bot.run()
+
