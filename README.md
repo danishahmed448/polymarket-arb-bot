@@ -80,7 +80,7 @@ MIN_SHARES = 5.0            # Minimum shares per side
 
 ☕ **Buy me a coffee** by sending USDC to:
 ```
-0x827dc8f9de9fd07905d391236655bbe46a70241f
+0x06422770fda6c2f4774f445ca5354d2cf6f25cec
 ```
 (Polygon/Ethereum/Base)
 
