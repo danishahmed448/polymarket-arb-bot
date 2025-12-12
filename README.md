@@ -76,6 +76,14 @@ MIN_SHARES = 5.0            # Minimum shares per side
 
 ⚠️ **Use at your own risk.** This bot trades real money. Past performance does not guarantee future results. Always test with small amounts first.
 
+## Support
+
+☕ **Buy me a coffee** by sending USDC to:
+```
+0x827dc8f9de9fd07905d391236655bbe46a70241f
+```
+(Polygon/Ethereum/Base)
+
 ## License
 
 MIT
