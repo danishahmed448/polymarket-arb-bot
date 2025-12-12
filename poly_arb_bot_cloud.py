@@ -803,22 +803,24 @@ class RealMoneyClient:
             logger.info(f"   NO:  ${cash_for_no} to buy ~{target_shares} shares @ {down_price}")
             logger.info(f"   Total: ${total_cost:.2f} | Payout: ${expected_payout:.2f} | Profit: ${expected_profit:.2f}")
 
-            # Create Market Orders with cash amounts
-            # FOK ensures: either BOTH fill completely, or NEITHER fills
-            order_args_yes = MarketOrderArgs(
+            # Create LIMIT Orders with EXACT share amounts (not cash!)
+            # This ensures we get exactly the same number of shares on each side
+            order_args_yes = OrderArgs(
                 token_id=token_yes,
-                amount=cash_for_yes,
+                size=target_shares,  # Exact number of shares
+                price=up_price,      # Limit price
                 side=BUY
             )
             
-            order_args_no = MarketOrderArgs(
+            order_args_no = OrderArgs(
                 token_id=token_no,
-                amount=cash_for_no,
+                size=target_shares,  # Same exact number of shares
+                price=down_price,    # Limit price
                 side=BUY
             )
             
             # Execute YES order with FOK
-            signed_yes = self.client.create_market_order(order_args_yes)
+            signed_yes = self.client.create_order(order_args_yes)
             resp_yes = self.client.post_order(signed_yes, OrderType.FOK)
             logger.info(f"YES Order Response: {resp_yes}")
             
@@ -830,7 +832,7 @@ class RealMoneyClient:
                 return False  # No need to cancel - FOK means nothing was filled
             
             # Execute NO order with FOK
-            signed_no = self.client.create_market_order(order_args_no)
+            signed_no = self.client.create_order(order_args_no)
             resp_no = self.client.post_order(signed_no, OrderType.FOK)
             logger.info(f"NO Order Response: {resp_no}")
             
@@ -945,10 +947,13 @@ class RealMoneyClient:
                 balance_0 = ctf_contract.functions.balanceOf(safe_address, position_id_0).call()
                 balance_1 = ctf_contract.functions.balanceOf(safe_address, position_id_1).call()
                 
+                logger.info(f"Merge check: YES balance={balance_0}, NO balance={balance_1}")
+                logger.info(f"Condition ID: {condition_id}")
+                
                 amount_wei = min(balance_0, balance_1)
                 
                 if amount_wei == 0:
-                    logger.warning("Merge failed: No tokens to merge")
+                    logger.warning(f"Merge failed: No tokens to merge (YES={balance_0}, NO={balance_1})")
                     return False
             else:
                 amount_wei = int(float(amount) * (10 ** USDCE_DIGITS))
