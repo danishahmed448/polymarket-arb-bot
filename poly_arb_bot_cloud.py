@@ -736,34 +736,53 @@ class RealMoneyClient:
             # Calculate the cost and validate spread
             total_spread = up_price + down_price
             
+            # SANITY CHECK: Spreads over 1.5 indicate dead/expired markets
+            if total_spread > 1.5:
+                logger.warning(f"⚠️ Spread {total_spread:.4f} > 1.5 indicates dead/expired market, skipping")
+                return False
+            
             # STRICTER threshold - only trade very good spreads
             if total_spread >= MIN_SPREAD_TARGET:
                 logger.info(f"Spread {total_spread:.4f} >= {MIN_SPREAD_TARGET}, not profitable enough, skipping")
                 return False
             
-            # PRE-TRADE LIQUIDITY CHECK: Ensure we can exit if needed
-            # Check bid-side liquidity on BOTH tokens before entering
+            # PRE-TRADE LIQUIDITY CHECK: Ensure enough depth exists
             try:
                 ob_yes = self.client.get_order_book(token_yes)
                 ob_no = self.client.get_order_book(token_no)
                 
-                def get_bid_liquidity(ob):
-                    """Get total bid-side liquidity value in USD."""
-                    bids = []
-                    if hasattr(ob, 'bids') and ob.bids:
-                        bids = ob.bids
-                    elif isinstance(ob, dict) and ob.get('bids'):
-                        bids = ob['bids']
+                def get_liquidity(ob, side='bids'):
+                    """Get total liquidity value in USD for given side."""
+                    items = []
+                    if hasattr(ob, side) and getattr(ob, side):
+                        items = getattr(ob, side)
+                    elif isinstance(ob, dict) and ob.get(side):
+                        items = ob[side]
                     
                     total_liquidity = 0
-                    for bid in bids:
-                        price = float(bid.price) if hasattr(bid, 'price') else float(bid['price'])
-                        size = float(bid.size) if hasattr(bid, 'size') else float(bid['size'])
+                    for item in items:
+                        price = float(item.price) if hasattr(item, 'price') else float(item['price'])
+                        size = float(item.size) if hasattr(item, 'size') else float(item['size'])
                         total_liquidity += price * size
                     return total_liquidity
                 
-                yes_bid_liquidity = get_bid_liquidity(ob_yes)
-                no_bid_liquidity = get_bid_liquidity(ob_no)
+                # Check ASK liquidity (needed to BUY)
+                yes_ask_liquidity = get_liquidity(ob_yes, 'asks')
+                no_ask_liquidity = get_liquidity(ob_no, 'asks')
+                
+                min_buy_liquidity = BET_SIZE * 0.8  # Need 80% of bet size in asks to buy
+                
+                if yes_ask_liquidity < min_buy_liquidity:
+                    logger.warning(f"⚠️ Insufficient YES ask liquidity (${yes_ask_liquidity:.2f}), skipping trade")
+                    return False
+                
+                if no_ask_liquidity < min_buy_liquidity:
+                    logger.warning(f"⚠️ Insufficient NO ask liquidity (${no_ask_liquidity:.2f}), skipping trade")
+                    return False
+                
+                # Check BID liquidity (needed for emergency exit)
+                yes_bid_liquidity = get_liquidity(ob_yes, 'bids')
+                no_bid_liquidity = get_liquidity(ob_no, 'bids')
                 
                 min_exit_liquidity = BET_SIZE * 0.5  # Need at least 50% of bet size in bids to exit
                 
@@ -775,7 +794,7 @@ class RealMoneyClient:
                     logger.warning(f"⚠️ Insufficient NO bid liquidity (${no_bid_liquidity:.2f}), skipping trade")
                     return False
                     
-                logger.info(f"✅ Liquidity check passed: YES bids ${yes_bid_liquidity:.2f}, NO bids ${no_bid_liquidity:.2f}")
+                logger.info(f"✅ Liquidity check passed: YES asks ${yes_ask_liquidity:.2f}, NO asks ${no_ask_liquidity:.2f}")
                 
             except Exception as liq_e:
                 logger.warning(f"⚠️ Liquidity check failed: {liq_e}, proceeding with caution")
@@ -797,7 +816,7 @@ class RealMoneyClient:
             expected_payout = target_shares * 1.00  # $1 per pair at resolution
             expected_profit = expected_payout - total_cost
             
-            logger.info(f"🎯 Sending FOK Market Orders (SAFER - MarketOrderArgs):")
+            logger.info(f"🎯 Sending FOK Limit Orders (EXACT SHARES - OrderArgs):")
             logger.info(f"   Target: {target_shares} shares on EACH side")
             logger.info(f"   YES: ${cash_for_yes} to buy ~{target_shares} shares @ {up_price}")
             logger.info(f"   NO:  ${cash_for_no} to buy ~{target_shares} shares @ {down_price}")
