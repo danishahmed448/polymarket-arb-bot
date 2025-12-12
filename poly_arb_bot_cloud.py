@@ -1526,8 +1526,7 @@ class ArbitrageBot:
                     tokens = res['market'].get('_tokens')
                     
                     # Execute with condition_id to prevent re-trading same market
-                    if self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares, condition_id=cid):
-                        self.real_client.merge_and_settle(cid)
+                    self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares, condition_id=cid)
 
     def _get_best_ask(self, ob, return_available_shares=False):
         """
