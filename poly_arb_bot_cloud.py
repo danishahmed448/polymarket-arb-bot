@@ -109,7 +109,7 @@ def is_market_live(market, event):
 MAX_WORKERS = 10              # Parallel order book fetches
 MAX_REQUESTS_PER_SECOND = 8   # Rate limit to avoid 429s
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+logging.basicConfig(level=logging.ERROR, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
 # Thread lock for safe access to shared state
