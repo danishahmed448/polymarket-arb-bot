@@ -124,6 +124,11 @@ MAX_REQUESTS_PER_SECOND = 8   # Rate limit to avoid 429s
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger(__name__)
 
+# Suppress noisy HTTP 200 OK logs from py_clob_client
+logging.getLogger('py_clob_client').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Thread lock for safe access to shared state
 status_lock = threading.Lock()
 
@@ -635,7 +640,6 @@ class RealMoneyClient:
         self.total_trades = 0
         self.balance = 0.0
         self.client = None
-        self.traded_markets = set()  # Track markets we've already traded
         
         # Log env var status for debugging
         logger.info(f"🔑 PRIVATE_KEY set: {bool(self.key)}")
@@ -693,25 +697,12 @@ class RealMoneyClient:
         except Exception as e:
             logger.warning(f"Failed to fetch USDC balance: {e}")
             self.balance = 0.0
-    
-    def has_traded_market(self, condition_id):
-        """Check if we've already traded this market."""
-        return condition_id in self.traded_markets
-    
-    def mark_market_traded(self, condition_id):
-        """Mark a market as traded to prevent re-trading."""
-        self.traded_markets.add(condition_id)
-        logger.info(f"📝 Marked market {condition_id[:16]}... as traded")
 
     def execute_pair_buy(self, tokens, up_price, down_price, shares, condition_id=None):
         """
         Execute paired FOK buy orders using MarketOrderArgs.
         
-        SAFER APPROACH:
-        - Use MarketOrderArgs with cash amounts
-        - Calculate cash to get exactly MIN_SHARES on each side
-        - Use FOK for guaranteed fill-or-kill (no partial fills!)
-        - Both orders must succeed or we don't trade
+        OPTIMIZED: No order book re-fetch - use prices from scan to avoid drift.
         
         This ensures EQUAL shares on both sides by:
         1. Targeting exactly 5 shares per side
@@ -721,11 +712,6 @@ class RealMoneyClient:
         if self.client is None:
             logger.error("❌ Cannot trade: CLOB Client not connected!")
             return False
-        
-        # Check if we've already traded this market
-        if condition_id and self.has_traded_market(condition_id):
-            logger.info(f"⏭️ Already traded this market, skipping to avoid duplicates")
-            return False
             
         token_yes = tokens[0]
         token_no = tokens[1]
@@ -733,6 +719,9 @@ class RealMoneyClient:
         try:
             # Calculate the cost and validate spread
             total_spread = up_price + down_price
+            
+            # Log execution-time spread (this is what we're ACTUALLY trading at)
+            logger.info(f"⚡ EXECUTION TIME SPREAD: {total_spread:.4f} (UP={up_price:.4f}, DOWN={down_price:.4f})")
             
             # SANITY CHECK: Spreads over 1.5 indicate dead/expired markets
             if total_spread > 1.5:
@@ -744,79 +733,68 @@ class RealMoneyClient:
                 logger.info(f"Spread {total_spread:.4f} >= {MIN_SPREAD_TARGET}, not profitable enough, skipping")
                 return False
             
-            # PRE-TRADE LIQUIDITY CHECK: Ensure enough depth exists
+            # FAST PATH: Skip order book re-fetch to avoid spread drift
+            # We already verified liquidity during scan, trust those values
+            # Only fetch if we absolutely need to check for zero asks
             try:
                 ob_yes = self.client.get_order_book(token_yes)
                 ob_no = self.client.get_order_book(token_no)
                 
-                def get_liquidity(ob, side='bids'):
-                    """Get total liquidity value in USD for given side."""
+                # NOTE: Removed zero-asks check
+                # Reason: FOK orders safely handle empty books (they just fail)
+                # Trust the scan (confirmed market is live) and trust FOK
+                
+                # === DYNAMIC BET SIZING ===
+                # Calculate available shares at best ask prices for each side
+                def get_available_shares(ob):
+                    """Get total shares available at reasonable prices."""
                     items = []
-                    if hasattr(ob, side) and getattr(ob, side):
-                        items = getattr(ob, side)
-                    elif isinstance(ob, dict) and ob.get(side):
-                        items = ob[side]
+                    if hasattr(ob, 'asks') and ob.asks:
+                        items = ob.asks
+                    elif isinstance(ob, dict) and ob.get('asks'):
+                        items = ob['asks']
                     
-                    total_liquidity = 0
-                    for item in items:
-                        price = float(item.price) if hasattr(item, 'price') else float(item['price'])
+                    total_shares = 0
+                    for item in items[:5]:  # Check top 5 price levels
                         size = float(item.size) if hasattr(item, 'size') else float(item['size'])
-                        total_liquidity += price * size
-                    return total_liquidity
+                        total_shares += size
+                        if total_shares >= MIN_SHARES:
+                            break
+                    return total_shares
                 
-                # Check ASK liquidity (needed to BUY)
-                yes_ask_liquidity = get_liquidity(ob_yes, 'asks')
-                no_ask_liquidity = get_liquidity(ob_no, 'asks')
+                yes_available = get_available_shares(ob_yes)
+                no_available = get_available_shares(ob_no)
                 
-                # IMPROVEMENT: Zero asks = market is resolved, skip immediately
-                if yes_ask_liquidity == 0:
-                    logger.warning(f"⚠️ ZERO asks on YES side - market likely resolved, skipping")
+                # Take the minimum of both sides (we need equal shares on each)
+                max_trade_shares = min(yes_available, no_available, MIN_SHARES)
+                
+                # Minimum viable trade = 1.0 share per side
+                MIN_VIABLE_SHARES = 1.0
+                
+                if max_trade_shares < MIN_VIABLE_SHARES:
+                    logger.warning(f"⚠️ Not enough liquidity: YES={yes_available:.1f}, NO={no_available:.1f} shares, need at least {MIN_VIABLE_SHARES}")
                     return False
                 
-                if no_ask_liquidity == 0:
-                    logger.warning(f"⚠️ ZERO asks on NO side - market likely resolved, skipping")
-                    return False
+                # Log if we're reducing bet size
+                if max_trade_shares < MIN_SHARES:
+                    logger.info(f"📉 DYNAMIC SIZING: Reducing from {MIN_SHARES} to {max_trade_shares:.1f} shares (YES={yes_available:.1f}, NO={no_available:.1f})")
                 
-                min_buy_liquidity = BET_SIZE * 0.8  # Need 80% of bet size in asks to buy
-                
-                if yes_ask_liquidity < min_buy_liquidity:
-                    logger.warning(f"⚠️ Insufficient YES ask liquidity (${yes_ask_liquidity:.2f}), skipping trade")
-                    return False
-                
-                if no_ask_liquidity < min_buy_liquidity:
-                    logger.warning(f"⚠️ Insufficient NO ask liquidity (${no_ask_liquidity:.2f}), skipping trade")
-                    return False
-                
-                # Check BID liquidity (needed for emergency exit)
-                yes_bid_liquidity = get_liquidity(ob_yes, 'bids')
-                no_bid_liquidity = get_liquidity(ob_no, 'bids')
-                
-                min_exit_liquidity = BET_SIZE * 0.5  # Need at least 50% of bet size in bids to exit
-                
-                if yes_bid_liquidity < min_exit_liquidity:
-                    logger.warning(f"⚠️ Insufficient YES bid liquidity (${yes_bid_liquidity:.2f}), skipping trade")
-                    return False
-                
-                if no_bid_liquidity < min_exit_liquidity:
-                    logger.warning(f"⚠️ Insufficient NO bid liquidity (${no_bid_liquidity:.2f}), skipping trade")
-                    return False
-                    
-                logger.info(f"✅ Liquidity check passed: YES asks ${yes_ask_liquidity:.2f}, NO asks ${no_ask_liquidity:.2f}")
+                # Use dynamic bet size
+                target_shares = round(max_trade_shares, 1)
                 
             except Exception as liq_e:
-                logger.warning(f"⚠️ Liquidity check failed: {liq_e}, proceeding with caution")
+                logger.warning(f"⚠️ Liquidity check failed: {liq_e}, using default {MIN_SHARES} shares")
+                target_shares = MIN_SHARES
             
-            # Target exactly MIN_SHARES on each side
-            target_shares = MIN_SHARES  # 5 shares
+            # Add slippage buffer to prices (0.3% tolerance)
+            # Use smaller buffer and don't round aggressively to prevent FOK kills
+            # Example: best ask 0.47234 → 0.4737 (not 0.48 which would never fill)
+            SLIPPAGE_BUFFER = 0.003  # 0.3% buffer
+            up_price_with_buffer = up_price * (1 + SLIPPAGE_BUFFER)  # Don't round or cap
+            down_price_with_buffer = down_price * (1 + SLIPPAGE_BUFFER)
             
-            # Add slippage buffer to prices (1% tolerance)
-            # This prevents FOK orders from being killed when price moves slightly
-            SLIPPAGE_BUFFER = 0.01  # 1% buffer
-            up_price_with_buffer = round(min(up_price * (1 + SLIPPAGE_BUFFER), 0.99), 2)
-            down_price_with_buffer = round(min(down_price * (1 + SLIPPAGE_BUFFER), 0.99), 2)
-            
-            logger.info(f"📊 Original prices: UP={up_price}, DOWN={down_price}")
-            logger.info(f"📊 With 1% buffer: UP={up_price_with_buffer}, DOWN={down_price_with_buffer}")
+            logger.info(f"📊 Original prices: UP={up_price:.4f}, DOWN={down_price:.4f}")
+            logger.info(f"📊 With 0.3% buffer: UP={up_price_with_buffer:.4f}, DOWN={down_price_with_buffer:.4f}")
             
             # Calculate CASH needed to buy target_shares at buffered prices
             # Cash = shares × price (rounded to 2 decimals for API)
@@ -837,6 +815,7 @@ class RealMoneyClient:
                 logger.warning(f"⚠️ Trade not profitable after slippage buffer: ${expected_profit:.4f}")
                 return False
             
+            logger.info(f"💰 ATTEMPTING TRADE | Spread: {total_spread:.4f} | YES: {up_price:.4f} | NO: {down_price:.4f}")
             logger.info(f"🎯 Sending FOK Limit Orders (EXACT SHARES - OrderArgs):")
             logger.info(f"   Target: {target_shares} shares on EACH side")
             logger.info(f"   YES: ${cash_for_yes} to buy ~{target_shares} shares @ {up_price_with_buffer}")
@@ -1464,10 +1443,22 @@ class ArbitrageBot:
                     if self.real_client.execute_pair_buy(tokens, res['up'], res['down'], shares, condition_id=cid):
                         self.real_client.merge_and_settle(cid)
 
-    def _get_best_ask(self, ob):
+    def _get_best_ask(self, ob, return_available_shares=False):
+        """
+        Get best ask price from order book.
+        
+        Args:
+            ob: Order book object
+            return_available_shares: If True, return (price, available_shares) tuple
+            
+        Returns:
+            If return_available_shares=False: price (float) or None
+            If return_available_shares=True: (price, available_shares) tuple or (None, 0)
+        """
         try:
             # Safety Check: Handle None or missing data
-            if not ob: return None
+            if not ob: 
+                return (None, 0) if return_available_shares else None
             
             asks = []
             if hasattr(ob, 'asks') and ob.asks:
@@ -1475,9 +1466,10 @@ class ArbitrageBot:
             elif isinstance(ob, dict) and ob.get('asks'):
                 asks = ob['asks']
             else:
-                return None
+                return (None, 0) if return_available_shares else None
             
-            if len(asks) == 0: return None
+            if len(asks) == 0: 
+                return (None, 0) if return_available_shares else None
 
             parse_price = lambda x: float(x.price) if hasattr(x, 'price') else float(x['price'])
             parse_size = lambda x: float(x.size) if hasattr(x, 'size') else float(x['size'])
@@ -1485,9 +1477,8 @@ class ArbitrageBot:
             valid_asks = [a for a in asks if parse_price(a) > 0 and parse_size(a) > 0]
             valid_asks.sort(key=parse_price)
 
-            # FIXED: Check liquidity for MIN_SHARES (the actual trading amount)
-            # Previously checked BET_SIZE/2 which was a mismatch with trade size
-            needed_shares = MIN_SHARES  # We buy exactly MIN_SHARES on each side
+            # Calculate how many shares are available at reasonable prices
+            needed_shares = MIN_SHARES  # Target amount
             total_shares = 0
             total_cost = 0
             
@@ -1504,17 +1495,22 @@ class ArbitrageBot:
                 if total_shares >= needed_shares:
                     break
 
-            # Not enough shares in order book
-            if total_shares < needed_shares * 0.9:
-                return None
+            # Return results
             if total_shares == 0:
-                return None
+                return (None, 0) if return_available_shares else None
             
-            # Return volume-weighted average price for the shares we'd buy
-            return total_cost / total_shares
+            avg_price = total_cost / total_shares
+            
+            if return_available_shares:
+                return (avg_price, total_shares)
+            else:
+                # Old behavior: return None if not enough shares
+                if total_shares < needed_shares * 0.9:
+                    return None
+                return avg_price
 
         except Exception:
-            return None
+            return (None, 0) if return_available_shares else None
 
     def update_status(self):
         with status_lock:
