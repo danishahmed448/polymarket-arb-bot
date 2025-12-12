@@ -41,9 +41,9 @@ RPC_URL = os.environ.get('RPC_URL', 'https://polygon-rpc.com/')
 # 'ALL_BINARY'  = Scan ALL binary markets on Polymarket - 300+ markets
 SCAN_MODE = 'ALL_BINARY'  # Starting mode (will auto-switch if enabled)
 
-# AUTO-SWITCH: Toggle between modes every hour
+# AUTO-SWITCH: Toggle between modes every 3 minutes
 AUTO_SWITCH_MODE = True   # Set to False to disable auto-switching
-MODE_SWITCH_INTERVAL = 3600  # Switch every 3600 seconds (1 hour)
+MODE_SWITCH_INTERVAL = 180  # Switch every 180 seconds (3 minutes)
 
 # Maximum markets to scan in ALL_BINARY mode
 ALL_BINARY_MARKET_LIMIT = 300
@@ -892,10 +892,6 @@ class RealMoneyClient:
             # BOTH orders succeeded!
             logger.info(f"✅ ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {total_spread:.4f}")
             logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
-            
-            # Mark this market as traded to prevent re-trading
-            if condition_id:
-                self.mark_market_traded(condition_id)
             
             self.total_trades += 1
             return True
