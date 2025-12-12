@@ -20,7 +20,7 @@ from abi.safe_abi import safe_abi
 
 # --- Configuration ---
 INITIAL_BALANCE = 1000.0      # Virtual balance for dashboard display only
-MIN_SPREAD_TARGET = 0.99       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
+MIN_SPREAD_TARGET = 0.98       # ⚠️ TESTING MODE: Breakeven (CHANGE BACK TO 0.98!)
 POLL_INTERVAL = 1.0           # Fast polling
 BET_SIZE = 5.0                # Must be at least $5 to meet minimum 5 share requirement
 MIN_SHARES = 5.0              # Polymarket minimum order size
@@ -144,6 +144,8 @@ bot_status = {
     'running': True,
     'current_mode': SCAN_MODE,  # Track current scan mode
     'last_mode_switch': 0,      # Timestamp of last mode switch
+    'monthly_pnl': 0.0,         # Monthly PnL from Polymarket API
+    'api_trades': 0,            # Trade count from activity API
 }
 
 class RateLimiter:
@@ -163,6 +165,46 @@ class RateLimiter:
 
 # Global rate limiter for CLOB API
 clob_rate_limiter = RateLimiter(max_per_second=MAX_REQUESTS_PER_SECOND)
+
+def fetch_monthly_pnl():
+    """Fetch monthly PnL from Polymarket API using FUNDER_ADDRESS."""
+    try:
+        funder = os.environ.get("FUNDER_ADDRESS")
+        if not funder:
+            return 0.0
+        
+        url = f"https://user-pnl-api.polymarket.com/user-pnl?user_address={funder}&interval=1m&fidelity=1d"
+        resp = requests.get(url, timeout=10)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            # Get the last item's 'p' value (current monthly PnL)
+            if data and len(data) > 0:
+                return float(data[-1].get('p', 0))
+        return 0.0
+    except Exception as e:
+        logger.warning(f"Failed to fetch monthly PnL: {e}")
+        return 0.0
+
+def fetch_total_trades():
+    """Fetch total trade count from Polymarket activity API using FUNDER_ADDRESS."""
+    try:
+        funder = os.environ.get("FUNDER_ADDRESS")
+        if not funder:
+            return 0
+        
+        url = f"https://data-api.polymarket.com/activity?user={funder}&limit=100&offset=0&sortBy=TIMESTAMP&sortDirection=DESC"
+        resp = requests.get(url, timeout=10)
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            # Count objects with type="TRADE"
+            trade_count = sum(1 for item in data if item.get('type') == 'TRADE')
+            return trade_count
+        return 0
+    except Exception as e:
+        logger.warning(f"Failed to fetch total trades: {e}")
+        return 0
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -192,6 +234,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             checks = bot_status['checks']
             last_update = bot_status['last_update']
             recent_checks = list(bot_status.get('recent_checks', [])[-10:])
+            monthly_pnl = bot_status.get('monthly_pnl', 0.0)
+            api_trades = bot_status.get('api_trades', 0)
         
         # Coin colors mapping
         coin_colors = {
@@ -594,8 +638,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <div class="stat-label">Balance</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">📈</div>
-                <div class="stat-value blue">{total_trades}</div>
+                <div class="stat-icon">�</div>
+                <div class="stat-value {'green' if monthly_pnl >= 0 else 'red'}">${monthly_pnl:+.2f}</div>
+                <div class="stat-label">Monthly PnL</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-icon">�📈</div>
+                <div class="stat-value blue">{api_trades}</div>
                 <div class="stat-label">Trades</div>
             </div>
             <div class="stat-card">
@@ -1149,10 +1198,17 @@ class ArbitrageBot:
                             no_idx = 1
                             for i, outcome in enumerate(outcomes):
                                 outcome_lower = str(outcome).lower()
-                                if 'yes' in outcome_lower or 'up' in outcome_lower:
+                                # SAFETY FIX: Split into words to avoid matching "no" inside "Illinois"
+                                words = set(outcome_lower.replace('(', ' ').replace(')', ' ').split())
+                                
+                                if 'yes' in words or 'up' in words:
                                     yes_idx = i
-                                elif 'no' in outcome_lower or 'down' in outcome_lower:
+                                elif 'no' in words or 'down' in words:
                                     no_idx = i
+                            
+                            # SAFETY CHECK: If logic failed and mapped both to same token, revert to default
+                            if yes_idx == no_idx:
+                                yes_idx, no_idx = 0, 1
                             
                             ordered_tokens = [tokens[yes_idx], tokens[no_idx]] if len(tokens) >= 2 else tokens[:2]
                             
@@ -1252,10 +1308,17 @@ class ArbitrageBot:
                             no_idx = 1   # default
                             for i, outcome in enumerate(outcomes):
                                 outcome_lower = str(outcome).lower()
-                                if 'yes' in outcome_lower or 'up' in outcome_lower:
+                                # SAFETY FIX: Split into words to avoid matching "no" inside "Illinois"
+                                words = set(outcome_lower.replace('(', ' ').replace(')', ' ').split())
+                                
+                                if 'yes' in words or 'up' in words:
                                     yes_idx = i
-                                elif 'no' in outcome_lower or 'down' in outcome_lower:
+                                elif 'no' in words or 'down' in words:
                                     no_idx = i
+                            
+                            # SAFETY CHECK: If logic failed and mapped both to same token, revert to default
+                            if yes_idx == no_idx:
+                                yes_idx, no_idx = 0, 1
                             
                             # Reorder tokens so [0] is always YES/UP and [1] is always NO/DOWN
                             if len(tokens) >= 2 and yes_idx < len(tokens) and no_idx < len(tokens):
@@ -1515,6 +1578,9 @@ class ArbitrageBot:
             # Use IST timezone (UTC+5:30)
             ist = timezone(timedelta(hours=5, minutes=30))
             bot_status['last_update'] = datetime.now(ist).strftime('%H:%M:%S')
+            # Fetch monthly PnL and total trades from Polymarket API
+            bot_status['monthly_pnl'] = fetch_monthly_pnl()
+            bot_status['api_trades'] = fetch_total_trades()
 
     def run(self):
         logger.info("🚀 Starting LIVE Polymarket Bot (Real Money)")
@@ -1543,4 +1609,3 @@ class ArbitrageBot:
 if __name__ == "__main__":
     bot = ArbitrageBot()
     bot.run()
-
