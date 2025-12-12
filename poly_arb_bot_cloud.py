@@ -36,7 +36,15 @@ USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
 USDCE_DIGITS = 6
 RPC_URL = os.environ.get('RPC_URL', 'https://polygon-rpc.com/')
 
-# --- Multi-Timeframe Configuration ---
+# --- SCAN MODE TOGGLE ---
+# 'CRYPTO_ONLY' = Only scan crypto Up/Down markets (15m, 1H, 4H, Daily) - 16 markets
+# 'ALL_BINARY'  = Scan ALL binary markets on Polymarket - 100+ markets
+SCAN_MODE = 'ALL_BINARY'  # Change to 'CRYPTO_ONLY' to scan only crypto markets
+
+# Maximum markets to scan in ALL_BINARY mode
+ALL_BINARY_MARKET_LIMIT = 100
+
+# --- Multi-Timeframe Configuration (for CRYPTO_ONLY mode) ---
 # Discovered from Polymarket API (Chrome Network Tab)
 TIMEFRAME_CONFIG = {
     '15-min': {
@@ -71,7 +79,7 @@ TIMEFRAME_CONFIG = {
     },
 }
 
-# Which timeframes to scan (set to True to enable)
+# Which timeframes to scan (for CRYPTO_ONLY mode)
 ENABLED_TIMEFRAMES = {
     '15-min': True,
     '1-hour': True,
@@ -795,10 +803,19 @@ class RealMoneyClient:
             # Target exactly MIN_SHARES on each side
             target_shares = MIN_SHARES  # 5 shares
             
-            # Calculate CASH needed to buy target_shares at each price
+            # Add slippage buffer to prices (1% tolerance)
+            # This prevents FOK orders from being killed when price moves slightly
+            SLIPPAGE_BUFFER = 0.01  # 1% buffer
+            up_price_with_buffer = round(min(up_price * (1 + SLIPPAGE_BUFFER), 0.99), 2)
+            down_price_with_buffer = round(min(down_price * (1 + SLIPPAGE_BUFFER), 0.99), 2)
+            
+            logger.info(f"📊 Original prices: UP={up_price}, DOWN={down_price}")
+            logger.info(f"📊 With 1% buffer: UP={up_price_with_buffer}, DOWN={down_price_with_buffer}")
+            
+            # Calculate CASH needed to buy target_shares at buffered prices
             # Cash = shares × price (rounded to 2 decimals for API)
-            cash_for_yes = round(target_shares * up_price, 2)
-            cash_for_no = round(target_shares * down_price, 2)
+            cash_for_yes = round(target_shares * up_price_with_buffer, 2)
+            cash_for_no = round(target_shares * down_price_with_buffer, 2)
             
             # Ensure minimum cash amounts
             if cash_for_yes < 0.10 or cash_for_no < 0.10:
@@ -809,10 +826,15 @@ class RealMoneyClient:
             expected_payout = target_shares * 1.00  # $1 per pair at resolution
             expected_profit = expected_payout - total_cost
             
+            # Verify still profitable after slippage buffer
+            if expected_profit <= 0:
+                logger.warning(f"⚠️ Trade not profitable after slippage buffer: ${expected_profit:.4f}")
+                return False
+            
             logger.info(f"🎯 Sending FOK Limit Orders (EXACT SHARES - OrderArgs):")
             logger.info(f"   Target: {target_shares} shares on EACH side")
-            logger.info(f"   YES: ${cash_for_yes} to buy ~{target_shares} shares @ {up_price}")
-            logger.info(f"   NO:  ${cash_for_no} to buy ~{target_shares} shares @ {down_price}")
+            logger.info(f"   YES: ${cash_for_yes} to buy ~{target_shares} shares @ {up_price_with_buffer}")
+            logger.info(f"   NO:  ${cash_for_no} to buy ~{target_shares} shares @ {down_price_with_buffer}")
             logger.info(f"   Total: ${total_cost:.2f} | Payout: ${expected_payout:.2f} | Profit: ${expected_profit:.2f}")
 
             # Create LIMIT Orders with EXACT share amounts (not cash!)
@@ -820,14 +842,14 @@ class RealMoneyClient:
             order_args_yes = OrderArgs(
                 token_id=token_yes,
                 size=target_shares,  # Exact number of shares
-                price=up_price,      # Limit price
+                price=up_price_with_buffer,  # Limit price WITH buffer
                 side=BUY
             )
             
             order_args_no = OrderArgs(
                 token_id=token_no,
                 size=target_shares,  # Same exact number of shares
-                price=down_price,    # Limit price
+                price=down_price_with_buffer,  # Limit price WITH buffer
                 side=BUY
             )
             
@@ -1058,13 +1080,100 @@ class ArbitrageBot:
             bot_status['total_trades'] = self.real_client.total_trades
 
     def scan_markets(self):
-        """Scan all enabled timeframes for LIVE crypto Up/Down markets only."""
+        """Scan markets based on SCAN_MODE setting."""
         try:
             # Refresh USDC balance
             self.real_client.update_balance()
             
             found = []
             
+            # === ALL_BINARY MODE: Scan all binary markets on Polymarket ===
+            if SCAN_MODE == 'ALL_BINARY':
+                logger.info(f"🔄 Scanning ALL binary markets (limit: {ALL_BINARY_MARKET_LIMIT})...")
+                
+                try:
+                    # Fetch all active, unclosed markets sorted by volume
+                    resp = requests.get(
+                        f"{GAMMA_API_URL}/markets",
+                        params={
+                            'active': 'true',
+                            'closed': 'false',
+                            'limit': ALL_BINARY_MARKET_LIMIT,
+                            'order': 'volume',
+                            'ascending': 'false'
+                        },
+                        timeout=30
+                    )
+                    
+                    if resp.status_code != 200:
+                        logger.error(f"ALL_BINARY API error: {resp.status_code}")
+                    else:
+                        markets = resp.json()
+                        logger.info(f"   Fetched {len(markets)} markets from API")
+                        
+                        for m in markets:
+                            # Only process binary markets (2 outcomes)
+                            outcomes = m.get('outcomes', '[]')
+                            if isinstance(outcomes, str):
+                                try:
+                                    outcomes = json.loads(outcomes)
+                                except:
+                                    outcomes = []
+                            
+                            if len(outcomes) != 2:
+                                continue  # Skip non-binary markets
+                            
+                            # Skip closed markets
+                            if m.get('closed') == True:
+                                continue
+                            
+                            # Parse tokens
+                            try:
+                                tokens = m.get('clobTokenIds', [])
+                                if isinstance(tokens, str):
+                                    tokens = json.loads(tokens)
+                            except:
+                                tokens = []
+                            
+                            if len(tokens) < 2:
+                                continue
+                            
+                            # Map outcomes to tokens (same order)
+                            yes_idx = 0
+                            no_idx = 1
+                            for i, outcome in enumerate(outcomes):
+                                outcome_lower = str(outcome).lower()
+                                if 'yes' in outcome_lower or 'up' in outcome_lower:
+                                    yes_idx = i
+                                elif 'no' in outcome_lower or 'down' in outcome_lower:
+                                    no_idx = i
+                            
+                            ordered_tokens = [tokens[yes_idx], tokens[no_idx]] if len(tokens) >= 2 else tokens[:2]
+                            
+                            # Add market with metadata
+                            m['_tokens'] = ordered_tokens
+                            m['_timeframe'] = 'ALL'
+                            m['_event_slug'] = m.get('slug', '')
+                            m['_coin'] = 'BINARY'  # Generic for non-crypto
+                            m['_end_date'] = m.get('endDate') or ''
+                            
+                            found.append(m)
+                        
+                        logger.info(f"   Found {len(found)} binary markets to scan")
+                        
+                except Exception as e:
+                    logger.error(f"ALL_BINARY scan error: {e}")
+                
+                self.target_markets = found
+                self.last_scan_time = time.time()
+                
+                with status_lock:
+                    bot_status['markets_count'] = len(found)
+                
+                logger.info(f"🔍 Total: {len(found)} BINARY markets")
+                return
+            
+            # === CRYPTO_ONLY MODE: Original crypto timeframe scanning ===
             logger.info("🔄 Scanning LIVE crypto markets (4 per timeframe)...")
             
             for timeframe, config in TIMEFRAME_CONFIG.items():
