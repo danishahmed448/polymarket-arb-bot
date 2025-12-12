@@ -962,6 +962,15 @@ class RealMoneyClient:
             logger.info(f"✅ ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {total_spread:.4f}")
             logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
             
+            # AUTO-MERGE: Convert YES+NO tokens back to USDC immediately
+            if condition_id:
+                logger.info(f"🔄 Auto-merging positions for condition: {condition_id[:20]}...")
+                merge_success = self.merge_and_settle(condition_id)
+                if merge_success:
+                    logger.info(f"💰 PROFIT REALIZED! Merged tokens back to USDC")
+                else:
+                    logger.warning(f"⚠️ Merge failed - tokens remain, will resolve at market end")
+            
             self.total_trades += 1
             return True
                 
