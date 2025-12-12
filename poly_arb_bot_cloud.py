@@ -242,7 +242,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             'BTC': '#f7931a',
             'ETH': '#627eea', 
             'SOL': '#9945ff',
-            'XRP': '#ffffff'
+            'XRP': '#ffffff',
+            'MKT': '#64748b'  # Gray for generic markets
         }
         
         recent_html = ''
@@ -258,12 +259,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 badge_class, badge_text = 'badge-wait', 'WAIT'
             
             q = check.get('q', 'Unknown')
-            coin = 'BTC' if 'Bitcoin' in q else 'ETH' if 'Ethereum' in q else 'SOL' if 'Solana' in q else 'XRP'
+            # Detect coin - use 'MKT' for non-crypto markets
+            if 'Bitcoin' in q or 'BTC' in q:
+                coin = 'BTC'
+            elif 'Ethereum' in q or 'ETH' in q:
+                coin = 'ETH'
+            elif 'Solana' in q or 'SOL' in q:
+                coin = 'SOL'
+            elif 'XRP' in q:
+                coin = 'XRP'
+            else:
+                coin = 'MKT'  # Generic market (non-crypto)
             coin_color = coin_colors.get(coin, '#64748b')
             safe_q = html.escape(q)
             
-            # Extract timeframe from question
-            timeframe = '15m' if '15' in q else '1H' if 'AM ET' in q or 'PM ET' in q else '4H' if 'AM-' in q or 'PM-' in q else 'D'
+            # Extract timeframe from question - use blank for non-timeframe markets
+            if '15 minute' in q.lower() or '15m' in q.lower():
+                timeframe = '15m'
+            elif 'AM ET' in q or 'PM ET' in q:
+                timeframe = '1H'
+            elif 'AM-' in q or 'PM-' in q:
+                timeframe = '4H'
+            elif 'Up or Down' in q:
+                timeframe = 'D'
+            else:
+                timeframe = ''  # No timeframe for generic binary markets
             
             recent_html += f'''
             <div class="market-card" style="animation-delay: {i * 0.05}s">
@@ -638,12 +658,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <div class="stat-label">Balance</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">�</div>
+                <div class="stat-icon">$</div>
                 <div class="stat-value {'green' if monthly_pnl >= 0 else 'red'}">${monthly_pnl:+.2f}</div>
                 <div class="stat-label">Monthly PnL</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">�📈</div>
+                <div class="stat-icon">#</div>
                 <div class="stat-value blue">{api_trades}</div>
                 <div class="stat-label">Trades</div>
             </div>
@@ -653,7 +673,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 <div class="stat-label">Markets</div>
             </div>
             <div class="stat-card">
-                <div class="stat-icon">⚡</div>
+                <div class="stat-icon">*</div>
                 <div class="stat-value yellow">{best_spread:.3f}</div>
                 <div class="stat-label">Best Spread</div>
             </div>
@@ -1323,8 +1343,6 @@ class ArbitrageBot:
                             # Reorder tokens so [0] is always YES/UP and [1] is always NO/DOWN
                             if len(tokens) >= 2 and yes_idx < len(tokens) and no_idx < len(tokens):
                                 ordered_tokens = [tokens[yes_idx], tokens[no_idx]]
-                                if outcomes:
-                                    logger.info(f"Token ordering: outcomes={outcomes}, yes_idx={yes_idx}, no_idx={no_idx}")
                             else:
                                 ordered_tokens = tokens[:2]
                                 logger.warning(f"Using default token order - outcomes={outcomes}")
