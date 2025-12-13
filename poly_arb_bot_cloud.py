@@ -906,36 +906,55 @@ class ArbitrageEngine:
                 logger.warning(f"⚠️ Batch order returned empty response")
                 return
             
-            # Analyze results
+            # === STRICT FILL VERIFICATION ===
+            # Check for actual fills, not just API success
+            yes_filled = False
+            no_filled = False
+            
             if isinstance(batch_response, list):
-                yes_success = len(batch_response) >= 1 and batch_response[0].get('success', False)
-                no_success = len(batch_response) >= 2 and batch_response[1].get('success', False)
+                # Check each order for 'status': 'matched' or non-empty 'transactionHash'
+                if len(batch_response) >= 1:
+                    r0 = batch_response[0]
+                    yes_filled = (r0.get('status') == 'matched' or 
+                                 r0.get('transactionHash') or 
+                                 r0.get('success', False))
+                if len(batch_response) >= 2:
+                    r1 = batch_response[1]
+                    no_filled = (r1.get('status') == 'matched' or 
+                                r1.get('transactionHash') or 
+                                r1.get('success', False))
             else:
                 # Single response object
-                yes_success = batch_response.get('success', False)
-                no_success = yes_success  # If batch succeeded, both did
+                yes_filled = (batch_response.get('status') == 'matched' or 
+                             batch_response.get('transactionHash'))
+                no_filled = yes_filled
             
-            if yes_success and no_success:
-                # BOTH orders succeeded!
-                logger.info(f"✅ BATCH ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {spread:.4f}")
+            # Log response for debugging
+            logger.info(f"📋 Batch Response: {batch_response}")
+            
+            if yes_filled and no_filled:
+                # BOTH orders CONFIRMED filled!
+                logger.info(f"✅ BATCH ARBITRAGE CONFIRMED: ~{target_shares} pairs @ spread {spread:.4f}")
                 logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
                 
                 self.stats['trades_executed'] += 1
                 self.stats['arb_opportunities'] += 1
                 
-                # Auto-merge
+                # Auto-merge with BLOCKCHAIN DELAY
                 condition_id = market.get('conditionId')
                 if condition_id:
+                    logger.info("⏳ Waiting 10s for blockchain settlement...")
+                    await asyncio.sleep(10)  # Critical: Wait for on-chain finality
                     await self.merge_and_settle_async(condition_id)
-            elif yes_success and not no_success:
+            elif yes_filled and not no_filled:
                 # Partial fill - YES succeeded, NO failed - DANGEROUS!
-                logger.error(f"❌ PARTIAL FILL! YES succeeded but NO failed!")
+                logger.error(f"❌ PARTIAL FILL! YES filled but NO not filled!")
                 logger.error(f"   Response: {batch_response}")
                 logger.error(f"   ACTION: Need to sell YES position to exit!")
-                # Note: FOK should prevent this, but log for safety
             else:
-                # Both failed or YES failed (safe - no position)
-                logger.warning(f"⚠️ Batch order not filled (FOK killed): {batch_response}")
+                # Both failed or not matched (safe - no position)
+                logger.warning(f"⚠️ Orders NOT FILLED (FOK Killed or Rejected)")
+                logger.warning(f"   Response: {batch_response}")
                 
         except Exception as e:
             logger.error(f"Trade execution error: {e}")
