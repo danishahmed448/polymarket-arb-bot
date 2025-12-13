@@ -949,10 +949,21 @@ class ArbitrageEngine:
                     logger.info("⏳ Waiting 10s for blockchain settlement...")
                     await asyncio.sleep(10)  # Critical: Wait for on-chain finality
                     await self.merge_and_settle_async(condition_id)
+                    
             elif yes_filled and not no_filled:
                 # Partial fill - YES succeeded, NO failed - DANGEROUS!
-                logger.error(f"❌ PARTIAL FILL! YES filled but NO not filled!")
-                logger.error(f"   ACTION: Need to sell YES position to exit!")
+                logger.error(f"🚨 PARTIAL FILL DANGER: YES filled, NO failed!")
+                logger.error(f"   Market: {market.get('question', 'Unknown')}")
+                logger.error(f"   ⚠️ EMERGENCY: You have NAKED YES position!")
+                logger.error(f"   ACTION: Manually SELL your YES shares on Polymarket NOW!")
+                
+            elif no_filled and not yes_filled:
+                # Partial fill - NO succeeded, YES failed - DANGEROUS!
+                logger.error(f"🚨 PARTIAL FILL DANGER: NO filled, YES failed!")
+                logger.error(f"   Market: {market.get('question', 'Unknown')}")
+                logger.error(f"   ⚠️ EMERGENCY: You have NAKED NO position!")
+                logger.error(f"   ACTION: Manually SELL your NO shares on Polymarket NOW!")
+                
             else:
                 # Both failed or not matched (safe - no position)
                 logger.warning(f"⚠️ Orders NOT FILLED (signature error, FOK killed, or rejected)")
