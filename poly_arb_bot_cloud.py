@@ -862,6 +862,15 @@ class ArbitrageEngine:
         if target_shares < MIN_SHARES:
             logger.warning(f"Target shares {target_shares} < minimum {MIN_SHARES}")
             return
+        
+        # === MIN $1 PER LEG CHECK ===
+        # Polymarket requires minimum $1 per order
+        cost_yes = target_shares * price_yes
+        cost_no = target_shares * price_no
+        
+        if cost_yes < Decimal('1.0') or cost_no < Decimal('1.0'):
+            logger.warning(f"⚠️ Skipping: One leg under $1 min (YES: ${cost_yes:.2f}, NO: ${cost_no:.2f})")
+            return
 
         # Add Slippage buffer to prices (2 decimals to ensure valid USDC cost)
         limit_yes = (price_yes * (Decimal('1') + SLIPPAGE_TOLERANCE)).quantize(Decimal("0.01"))
@@ -1027,7 +1036,7 @@ class ArbitrageEngine:
         Retries up to 10 times with 3 second gaps.
         """
         MAX_RETRIES = 10
-        RETRY_DELAY = 3  # seconds
+        RETRY_DELAY = 1  # seconds (reduced from 3 for faster exit)
         
         # Floor shares to integer to ensure valid USDC cost (2 decimals max)
         shares = int(shares)  # 10.281689 → 10
