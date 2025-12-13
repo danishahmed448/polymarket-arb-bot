@@ -75,9 +75,10 @@ USDC_ADDRESS = '0x2791bca1f2de4661ed88a30c99a7a9449aa84174'
 USDCE_DIGITS = 6
 
 # Scan Mode Configuration
-SCAN_MODE = 'ALL_BINARY'      # 'CRYPTO_ONLY' or 'ALL_BINARY'
+SCAN_MODE = 'CRYPTO_ONLY'     # Start with CRYPTO_ONLY first
 AUTO_SWITCH_MODE = True       # Toggle between modes
-MODE_SWITCH_INTERVAL = 180    # Switch every 3 minutes
+CRYPTO_ONLY_INTERVAL = 600    # CRYPTO_ONLY runs for 10 minutes
+ALL_BINARY_INTERVAL = 300     # ALL_BINARY runs for 5 minutes
 ALL_BINARY_MARKET_LIMIT = 300 # Max markets in ALL_BINARY mode
 
 # Multi-Timeframe Configuration (for CRYPTO_ONLY mode)
@@ -480,6 +481,13 @@ class ArbitrageEngine:
             logger.warning(f"Failed to fetch total trades: {e}")
             return 0
 
+    def _get_current_interval(self) -> int:
+        """Return the interval for current mode (asymmetric switching)."""
+        if self.current_mode == 'CRYPTO_ONLY':
+            return CRYPTO_ONLY_INTERVAL  # 10 minutes
+        else:
+            return ALL_BINARY_INTERVAL   # 5 minutes
+
     async def fetch_markets(self):
         """Fetch target markets based on current scan mode."""
         logger.info(f"🌍 Fetching markets in {self.current_mode} mode...")
@@ -489,12 +497,14 @@ class ArbitrageEngine:
             current_time = time.time()
             if self.last_mode_switch == 0:
                 self.last_mode_switch = current_time
-                logger.info(f"🔄 Mode switching enabled (every {MODE_SWITCH_INTERVAL}s). Starting in {self.current_mode} mode")
-            elif current_time - self.last_mode_switch >= MODE_SWITCH_INTERVAL:
+                interval = self._get_current_interval()
+                logger.info(f"🔄 Mode switching enabled. Starting in {self.current_mode} mode (for {interval // 60} min)")
+        elif current_time - self.last_mode_switch >= self._get_current_interval():
                 self.current_mode = 'CRYPTO_ONLY' if self.current_mode == 'ALL_BINARY' else 'ALL_BINARY'
                 self.last_mode_switch = current_time
                 self.stats['current_mode'] = self.current_mode
-                logger.info(f"🔁 MODE SWITCHED to {self.current_mode}")
+                next_interval = self._get_current_interval()
+                logger.info(f"🔁 MODE SWITCHED to {self.current_mode} (for {next_interval // 60} min)")
         
         found = []
         
@@ -848,7 +858,7 @@ class ArbitrageEngine:
 
         try:
             # Use py_clob_client for batch order execution
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
             from py_clob_client.order_builder.constants import BUY
             
             # Create sync client (reuse cached credentials if possible)
@@ -878,14 +888,18 @@ class ArbitrageEngine:
             signed_yes = sync_client.create_order(order_args_yes)
             signed_no = sync_client.create_order(order_args_no)
             
-            # === BATCH EXECUTION ===
-            # Send both orders in a SINGLE HTTP request for atomicity
+            # === BATCH EXECUTION (CORRECTED) ===
+            # Wrap signed orders in PostOrdersArgs with FOK type
+            batch_args = [
+                PostOrdersArgs(order=signed_yes, orderType=OrderType.FOK),
+                PostOrdersArgs(order=signed_no, orderType=OrderType.FOK)
+            ]
+            
             logger.info(f"📦 Sending BATCH order (YES + NO in single request)...")
             
             async with rate_limiter:  # Rate limit for batch order
-                # Use post_orders (plural) for batch execution
-                # The py_clob_client's post_order with list sends to /orders endpoint
-                batch_response = sync_client.post_orders([signed_yes, signed_no], OrderType.FOK)
+                # Correct: pass list of PostOrdersArgs
+                batch_response = sync_client.post_orders(batch_args)
             
             # Check batch response
             if not batch_response:
