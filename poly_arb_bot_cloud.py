@@ -861,12 +861,13 @@ class ArbitrageEngine:
             from py_clob_client.clob_types import OrderArgs, OrderType, PostOrdersArgs
             from py_clob_client.order_builder.constants import BUY
             
-            # Create sync client (reuse cached credentials if possible)
+            # --- FIX 1: Add signature_type=2 for Proxy Wallets (Gnosis Safe) ---
             sync_client = ClobClient(
                 host=CLOB_API_URL,
                 key=PRIVATE_KEY,
                 chain_id=POLYGON,
-                funder=FUNDER_ADDRESS
+                funder=FUNDER_ADDRESS,
+                signature_type=2  # CRITICAL: EIP-1271 Proxy signature
             )
             sync_client.set_api_creds(sync_client.create_or_derive_api_creds())
             
@@ -906,31 +907,33 @@ class ArbitrageEngine:
                 logger.warning(f"⚠️ Batch order returned empty response")
                 return
             
-            # === STRICT FILL VERIFICATION ===
-            # Check for actual fills, not just API success
+            # Log response for debugging FIRST
+            logger.info(f"📋 Batch Response: {batch_response}")
+            
+            # === FIX 2: STRICT FILL VERIFICATION ===
+            # Only trust 'matched' status or transactionHash - NEVER trust 'success' alone!
             yes_filled = False
             no_filled = False
             
             if isinstance(batch_response, list):
-                # Check each order for 'status': 'matched' or non-empty 'transactionHash'
+                # Check each order - look for errors first
                 if len(batch_response) >= 1:
                     r0 = batch_response[0]
-                    yes_filled = (r0.get('status') == 'matched' or 
-                                 r0.get('transactionHash') or 
-                                 r0.get('success', False))
+                    if r0.get('errorMsg'):
+                        logger.error(f"❌ Order 1 (YES) Error: {r0.get('errorMsg')}")
+                    yes_filled = (r0.get('status') == 'matched' or bool(r0.get('transactionHash')))
+                        
                 if len(batch_response) >= 2:
                     r1 = batch_response[1]
-                    no_filled = (r1.get('status') == 'matched' or 
-                                r1.get('transactionHash') or 
-                                r1.get('success', False))
+                    if r1.get('errorMsg'):
+                        logger.error(f"❌ Order 2 (NO) Error: {r1.get('errorMsg')}")
+                    no_filled = (r1.get('status') == 'matched' or bool(r1.get('transactionHash')))
             else:
                 # Single response object
-                yes_filled = (batch_response.get('status') == 'matched' or 
-                             batch_response.get('transactionHash'))
+                if batch_response.get('errorMsg'):
+                    logger.error(f"❌ Batch Error: {batch_response.get('errorMsg')}")
+                yes_filled = (batch_response.get('status') == 'matched' or bool(batch_response.get('transactionHash')))
                 no_filled = yes_filled
-            
-            # Log response for debugging
-            logger.info(f"📋 Batch Response: {batch_response}")
             
             if yes_filled and no_filled:
                 # BOTH orders CONFIRMED filled!
@@ -949,12 +952,10 @@ class ArbitrageEngine:
             elif yes_filled and not no_filled:
                 # Partial fill - YES succeeded, NO failed - DANGEROUS!
                 logger.error(f"❌ PARTIAL FILL! YES filled but NO not filled!")
-                logger.error(f"   Response: {batch_response}")
                 logger.error(f"   ACTION: Need to sell YES position to exit!")
             else:
                 # Both failed or not matched (safe - no position)
-                logger.warning(f"⚠️ Orders NOT FILLED (FOK Killed or Rejected)")
-                logger.warning(f"   Response: {batch_response}")
+                logger.warning(f"⚠️ Orders NOT FILLED (signature error, FOK killed, or rejected)")
                 
         except Exception as e:
             logger.error(f"Trade execution error: {e}")
