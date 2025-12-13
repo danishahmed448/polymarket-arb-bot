@@ -48,6 +48,12 @@ PRIVATE_KEY = os.environ.get("PRIVATE_KEY")
 FUNDER_ADDRESS = os.environ.get("FUNDER_ADDRESS")  # Polymarket Proxy (Gnosis Safe) Address
 WEB_PORT = int(os.environ.get('PORT', 8080))
 
+# Builder API Credentials (Optional - for order attribution)
+BUILDER_API_KEY = os.environ.get("POLY_BUILDER_API_KEY")
+BUILDER_SECRET = os.environ.get("POLY_BUILDER_SECRET")
+BUILDER_PASSPHRASE = os.environ.get("POLY_BUILDER_PASSPHRASE")
+BUILDER_ENABLED = bool(BUILDER_API_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE)
+
 # Trading Parameters (Using Decimal for precision)
 MIN_SPREAD_TARGET = Decimal('0.99')   # Only trade if spread < 0.98 (2% profit)
 BET_SIZE = Decimal('5.0')             # Target size in USDC
@@ -214,12 +220,41 @@ class AsyncClobClient:
             ).digest()
         ).decode('utf-8')
 
-        return {
+        headers = {
             "POLY-API-KEY": self.key,
             "POLY-API-SIGNATURE": signature,
             "POLY-API-TIMESTAMP": timestamp,
             "POLY-API-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
+        }
+        
+        # Add Builder headers if configured (for order attribution)
+        if BUILDER_ENABLED:
+            builder_headers = self._get_builder_headers(method, path, body)
+            headers.update(builder_headers)
+        
+        return headers
+    
+    def _get_builder_headers(self, method: str, path: str, body: str = "") -> Dict[str, str]:
+        """
+        Generate Builder API headers for order attribution.
+        Follows Polymarket docs: HMAC-SHA256 of timestamp + method + path + body
+        """
+        timestamp = str(int(time.time()))
+        sig_payload = f"{timestamp}{method}{path}{body}"
+        signature = base64.b64encode(
+            hmac.new(
+                BUILDER_SECRET.encode('utf-8'),
+                sig_payload.encode('utf-8'),
+                hashlib.sha256
+            ).digest()
+        ).decode('utf-8')
+        
+        return {
+            "POLY_BUILDER_API_KEY": BUILDER_API_KEY,
+            "POLY_BUILDER_TIMESTAMP": timestamp,
+            "POLY_BUILDER_PASSPHRASE": BUILDER_PASSPHRASE,
+            "POLY_BUILDER_SIGNATURE": signature,
         }
 
     async def get_order_books(self, token_ids: List[str]) -> List[Dict]:
@@ -1282,6 +1317,10 @@ class ArbitrageEngine:
         """Main entry point."""
         logger.info("🚀 Starting PolyArbBot V2 (High-Performance Async Engine)")
         logger.info(f"📊 Dashboard: http://localhost:{WEB_PORT}")
+        if BUILDER_ENABLED:
+            logger.info("🏷️  Builder API: ENABLED (orders attributed to ArbBot)")
+        else:
+            logger.info("🏷️  Builder API: DISABLED (set POLY_BUILDER_* env vars to enable)")
         
         # 1. Sync Startup Checks
         self.derive_keys()
