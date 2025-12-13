@@ -839,9 +839,9 @@ class ArbitrageEngine:
             logger.warning(f"Target shares {target_shares} < minimum {MIN_SHARES}")
             return
 
-        # Add Slippage buffer to prices
-        limit_yes = (price_yes * (Decimal('1') + SLIPPAGE_TOLERANCE)).quantize(Decimal("0.0001"))
-        limit_no = (price_no * (Decimal('1') + SLIPPAGE_TOLERANCE)).quantize(Decimal("0.0001"))
+        # Add Slippage buffer to prices (2 decimals to ensure valid USDC cost)
+        limit_yes = (price_yes * (Decimal('1') + SLIPPAGE_TOLERANCE)).quantize(Decimal("0.01"))
+        limit_no = (price_no * (Decimal('1') + SLIPPAGE_TOLERANCE)).quantize(Decimal("0.01"))
         
         total_cost = (limit_yes + limit_no) * target_shares
         expected_payout = target_shares * Decimal('1.0')
