@@ -55,7 +55,7 @@ BUILDER_PASSPHRASE = os.environ.get("POLY_BUILDER_PASSPHRASE")
 BUILDER_ENABLED = bool(BUILDER_API_KEY and BUILDER_SECRET and BUILDER_PASSPHRASE)
 
 # Trading Parameters (Using Decimal for precision)
-MIN_SPREAD_TARGET = Decimal('0.99')   # Only trade if spread < 0.98 (2% profit)
+MIN_SPREAD_TARGET = Decimal('1.0')    # Trade if spread <= $1.00
 BET_SIZE = Decimal('5.0')             # Target size in USDC
 MIN_SHARES = Decimal('5.0')           # Min shares per order
 SLIPPAGE_TOLERANCE = Decimal('0.003') # 0.3% slippage tolerance
