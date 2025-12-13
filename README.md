@@ -12,9 +12,17 @@ If YES @ $0.48 + NO @ $0.49 = $0.97
 
 ## Features
 
+### V2 (High-Performance Async Engine) ⚡
+- 🚀 **Async I/O** — 50x throughput with `aiohttp`
+- 📡 **WebSocket streaming** — Millisecond-level price reactions
+- 📦 **Batch orders** — YES + NO in single atomic request
+- 🔢 **Decimal math** — No floating-point precision errors
+- 🛡️ **Rate limiting** — Built-in 429 protection
+- 🏷️ **Builder API** — Order attribution for analytics
+
+### Core Features
 - 🎯 **Multi-timeframe scanning** — 15min, 1H, 4H, Daily markets
-- ⚡ **Fast polling** — Checks spreads every 1 second
-- 🛡️ **Safety features** — Liquidity checks, FOK orders, emergency exit
+- 🔄 **Dual mode** — CRYPTO_ONLY + ALL_BINARY with auto-switch
 - 💰 **Auto-merge** — Converts tokens back to USDC on-chain
 - 📊 **Live dashboard** — Monitor bot status via web UI
 
@@ -36,6 +44,10 @@ export FUNDER_ADDRESS=0xyour_polymarket_profile_address
 ### 3. Run
 
 ```bash
+# V2 (Recommended - High Performance)
+python poly_arb_bot_v2.py
+
+# V1 (Legacy - Synchronous)
 python poly_arb_bot_cloud.py
 ```
 
@@ -44,7 +56,8 @@ python poly_arb_bot_cloud.py
 1. Push to GitHub
 2. Connect repo to Railway
 3. Add environment variables in Railway dashboard
-4. Deploy
+4. Update `Procfile` to use `poly_arb_bot_v2.py`
+5. Deploy
 
 ## Environment Variables
 
@@ -54,22 +67,26 @@ python poly_arb_bot_cloud.py
 | `FUNDER_ADDRESS` | ✅ | Polymarket profile address |
 | `PORT` | ❌ | Dashboard port (default: 8080) |
 | `RPC_URL` | ❌ | Polygon RPC (default: polygon-rpc.com) |
+| `POLY_BUILDER_API_KEY` | ❌ | Builder API key (for order attribution) |
+| `POLY_BUILDER_SECRET` | ❌ | Builder API secret |
+| `POLY_BUILDER_PASSPHRASE` | ❌ | Builder API passphrase |
 
 ## Configuration
 
-Edit these values in `poly_arb_bot_cloud.py`:
+Edit these values in `poly_arb_bot_v2.py`:
 
 ```python
-MIN_SPREAD_TARGET = 0.98    # Only trade if spread < this
-BET_SIZE = 5.0              # USD per trade
-MIN_SHARES = 5.0            # Minimum shares per side
+MIN_SPREAD_TARGET = Decimal('0.99')  # Only trade if spread < this
+BET_SIZE = Decimal('5.0')            # USD per trade
+MIN_SHARES = Decimal('5.0')          # Minimum shares per side
 ```
 
 ## Safety Features
 
-- **Pre-trade liquidity check** — Skips illiquid markets
+- **Pre-flight allowance checks** — Verifies token approvals before trading
+- **Rate limiting** — Prevents 429 API bans
 - **FOK orders** — Fill-or-kill prevents partial fills
-- **Emergency exit** — Auto-sells if one leg fails
+- **Emergency exit** — Auto-logs if one leg fails
 - **Duplicate prevention** — Won't re-trade same market
 
 ## Disclaimer
@@ -87,3 +104,4 @@ MIN_SHARES = 5.0            # Minimum shares per side
 ## License
 
 MIT
+
