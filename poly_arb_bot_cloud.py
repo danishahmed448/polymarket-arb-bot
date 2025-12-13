@@ -831,9 +831,9 @@ class ArbitrageEngine:
         spread = price_yes + price_no
         logger.info(f"🚨 OPPORTUNITY: {market.get('question', '')[:50]}... | Spread: {spread:.4f}")
         
-        # Calculate Size
+        # Calculate Size - Round to INTEGER to ensure USDC cost has max 2 decimals
         target_shares = BET_SIZE / spread
-        target_shares = target_shares.quantize(Decimal("0.1"), rounding=ROUND_DOWN)
+        target_shares = target_shares.quantize(Decimal("1"), rounding=ROUND_DOWN)
         
         if target_shares < MIN_SHARES:
             logger.warning(f"Target shares {target_shares} < minimum {MIN_SHARES}")
