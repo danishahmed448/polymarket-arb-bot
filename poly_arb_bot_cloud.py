@@ -499,7 +499,7 @@ class ArbitrageEngine:
                 self.last_mode_switch = current_time
                 interval = self._get_current_interval()
                 logger.info(f"🔄 Mode switching enabled. Starting in {self.current_mode} mode (for {interval // 60} min)")
-        elif current_time - self.last_mode_switch >= self._get_current_interval():
+            elif current_time - self.last_mode_switch >= self._get_current_interval():
                 self.current_mode = 'CRYPTO_ONLY' if self.current_mode == 'ALL_BINARY' else 'ALL_BINARY'
                 self.last_mode_switch = current_time
                 self.stats['current_mode'] = self.current_mode
