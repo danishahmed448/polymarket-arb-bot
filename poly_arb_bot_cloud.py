@@ -955,14 +955,22 @@ class ArbitrageEngine:
                 logger.error(f"🚨 PARTIAL FILL DANGER: YES filled, NO failed!")
                 logger.error(f"   Market: {market.get('question', 'Unknown')}")
                 logger.error(f"   ⚠️ EMERGENCY: You have NAKED YES position!")
-                logger.error(f"   ACTION: Manually SELL your YES shares on Polymarket NOW!")
+                
+                # Emergency sell YES position
+                yes_token = tokens[0] if tokens else None
+                if yes_token:
+                    await self._emergency_sell(yes_token, float(target_shares), "YES")
                 
             elif no_filled and not yes_filled:
                 # Partial fill - NO succeeded, YES failed - DANGEROUS!
                 logger.error(f"🚨 PARTIAL FILL DANGER: NO filled, YES failed!")
                 logger.error(f"   Market: {market.get('question', 'Unknown')}")
                 logger.error(f"   ⚠️ EMERGENCY: You have NAKED NO position!")
-                logger.error(f"   ACTION: Manually SELL your NO shares on Polymarket NOW!")
+                
+                # Emergency sell NO position
+                no_token = tokens[1] if len(tokens) > 1 else None
+                if no_token:
+                    await self._emergency_sell(no_token, float(target_shares), "NO")
                 
             else:
                 # Both failed or not matched (safe - no position)
@@ -972,6 +980,78 @@ class ArbitrageEngine:
             logger.error(f"Trade execution error: {e}")
             import traceback
             logger.error(traceback.format_exc())
+
+    async def _emergency_sell(self, token_id: str, shares: float, side_name: str):
+        """
+        Emergency sell orphan position at market price to close risk.
+        Retries up to 10 times with 3 second gaps.
+        """
+        MAX_RETRIES = 10
+        RETRY_DELAY = 3  # seconds
+        
+        logger.warning(f"🚨 EMERGENCY SELL: Dumping {shares} {side_name} shares...")
+        
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        from py_clob_client.order_builder.constants import SELL
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                logger.info(f"   Attempt {attempt}/{MAX_RETRIES}...")
+                
+                # Create sync client for emergency sell
+                sync_client = ClobClient(
+                    host=CLOB_API_URL,
+                    key=PRIVATE_KEY,
+                    chain_id=POLYGON,
+                    funder=FUNDER_ADDRESS,
+                    signature_type=2  # Proxy wallet
+                )
+                sync_client.set_api_creds(sync_client.create_or_derive_api_creds())
+                
+                # Sell at floor price (0.01) for immediate fill
+                sell_args = OrderArgs(
+                    token_id=token_id,
+                    size=shares,
+                    price=0.01,  # Floor price - accept any buyer
+                    side=SELL
+                )
+                
+                signed_sell = sync_client.create_order(sell_args)
+                
+                async with rate_limiter:
+                    sell_response = sync_client.post_order(signed_sell, OrderType.GTC)
+                
+                logger.info(f"📋 Emergency Sell Response: {sell_response}")
+                
+                # Check if successful
+                if sell_response.get('status') == 'matched' or sell_response.get('transactionHash'):
+                    logger.info(f"✅ EMERGENCY SELL EXECUTED: {shares} {side_name} shares dumped!")
+                    return True
+                elif sell_response.get('orderID'):
+                    logger.info(f"📝 Emergency Sell order placed (orderID: {sell_response.get('orderID')})")
+                    logger.info(f"   Order will fill at market. Risk closed!")
+                    return True
+                else:
+                    logger.warning(f"   Attempt {attempt} failed: {sell_response.get('errorMsg', 'Unknown error')}")
+                    
+            except Exception as e:
+                logger.warning(f"   Attempt {attempt} error: {e}")
+            
+            # Wait before retry (except on last attempt)
+            if attempt < MAX_RETRIES:
+                logger.info(f"   Retrying in {RETRY_DELAY}s...")
+                await asyncio.sleep(RETRY_DELAY)
+        
+        # All retries failed - CRITICAL
+        logger.error(f"🚨🚨🚨 CRITICAL: ALL {MAX_RETRIES} EMERGENCY SELL ATTEMPTS FAILED!")
+        logger.error(f"   MANUAL ACTION REQUIRED IMMEDIATELY!")
+        logger.error(f"   Token: {token_id}")
+        logger.error(f"   Shares: {shares} {side_name}")
+        logger.error(f"   ⛔ STOPPING BOT to prevent more trades!")
+        
+        # Stop the bot to prevent more risky trades
+        self.running = False
+        return False
 
     async def merge_and_settle_async(self, condition_id: str, amount: Optional[str] = None, neg_risk: bool = False) -> bool:
         """Merge conditional tokens back to USDC (async wrapper)."""
