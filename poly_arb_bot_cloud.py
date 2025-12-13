@@ -910,24 +910,40 @@ class ArbitrageEngine:
             # Log response for debugging FIRST
             logger.info(f"📋 Batch Response: {batch_response}")
             
-            # === FIX 2: STRICT FILL VERIFICATION ===
-            # Only trust 'matched' status or transactionHash - NEVER trust 'success' alone!
+            # === STRICT FILL VERIFICATION WITH ACTUAL SIZES ===
             yes_filled = False
             no_filled = False
+            yes_filled_size = float(target_shares)  # Default fallback
+            no_filled_size = float(target_shares)   # Default fallback
             
             if isinstance(batch_response, list):
-                # Check each order - look for errors first
+                # Check Order 1 (YES)
                 if len(batch_response) >= 1:
                     r0 = batch_response[0]
                     if r0.get('errorMsg'):
                         logger.error(f"❌ Order 1 (YES) Error: {r0.get('errorMsg')}")
                     yes_filled = (r0.get('status') == 'matched' or bool(r0.get('transactionHash')))
+                    # CAPTURE ACTUAL FILLED SIZE from takingAmount
+                    if yes_filled and r0.get('takingAmount'):
+                        try:
+                            yes_filled_size = float(r0.get('takingAmount'))
+                            logger.info(f"   YES Actual Filled: {yes_filled_size} shares")
+                        except:
+                            pass
                         
+                # Check Order 2 (NO)
                 if len(batch_response) >= 2:
                     r1 = batch_response[1]
                     if r1.get('errorMsg'):
                         logger.error(f"❌ Order 2 (NO) Error: {r1.get('errorMsg')}")
                     no_filled = (r1.get('status') == 'matched' or bool(r1.get('transactionHash')))
+                    # CAPTURE ACTUAL FILLED SIZE from takingAmount
+                    if no_filled and r1.get('takingAmount'):
+                        try:
+                            no_filled_size = float(r1.get('takingAmount'))
+                            logger.info(f"   NO Actual Filled: {no_filled_size} shares")
+                        except:
+                            pass
             else:
                 # Single response object
                 if batch_response.get('errorMsg'):
@@ -956,10 +972,10 @@ class ArbitrageEngine:
                 logger.error(f"   Market: {market.get('question', 'Unknown')}")
                 logger.error(f"   ⚠️ EMERGENCY: You have NAKED YES position!")
                 
-                # Emergency sell YES position
+                # Emergency sell YES position - USE ACTUAL FILLED SIZE
                 yes_token = tokens[0] if tokens else None
                 if yes_token:
-                    await self._emergency_sell(yes_token, float(target_shares), "YES")
+                    await self._emergency_sell(yes_token, yes_filled_size, "YES")
                 
             elif no_filled and not yes_filled:
                 # Partial fill - NO succeeded, YES failed - DANGEROUS!
@@ -967,10 +983,10 @@ class ArbitrageEngine:
                 logger.error(f"   Market: {market.get('question', 'Unknown')}")
                 logger.error(f"   ⚠️ EMERGENCY: You have NAKED NO position!")
                 
-                # Emergency sell NO position
+                # Emergency sell NO position - USE ACTUAL FILLED SIZE
                 no_token = tokens[1] if len(tokens) > 1 else None
                 if no_token:
-                    await self._emergency_sell(no_token, float(target_shares), "NO")
+                    await self._emergency_sell(no_token, no_filled_size, "NO")
                 
             else:
                 # Both failed or not matched (safe - no position)
@@ -988,6 +1004,9 @@ class ArbitrageEngine:
         """
         MAX_RETRIES = 10
         RETRY_DELAY = 3  # seconds
+        
+        # Floor shares to integer to ensure valid USDC cost (2 decimals max)
+        shares = int(shares)  # 10.281689 → 10
         
         logger.warning(f"🚨 EMERGENCY SELL: Dumping {shares} {side_name} shares...")
         
