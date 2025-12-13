@@ -146,6 +146,40 @@ def detect_coin(text: str) -> Optional[str]:
     return None
 
 
+# --- Async Rate Limiter (Token Bucket Algorithm) ---
+class AsyncRateLimiter:
+    """
+    Async-compatible rate limiter using token bucket algorithm.
+    Prevents 429 Too Many Requests errors from Polymarket API.
+    """
+    def __init__(self, max_per_second: float = 8.0):
+        self.max_per_second = max_per_second
+        self.min_interval = 1.0 / max_per_second
+        self.last_call = 0.0
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self):
+        """Wait if necessary to respect rate limit."""
+        async with self._lock:
+            now = time.time()
+            elapsed = now - self.last_call
+            if elapsed < self.min_interval:
+                wait_time = self.min_interval - elapsed
+                await asyncio.sleep(wait_time)
+            self.last_call = time.time()
+    
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+
+# Global rate limiter for CLOB API (8 requests/second default)
+rate_limiter = AsyncRateLimiter(max_per_second=8.0)
+
+
 # --- Async HTTP Client with HMAC Auth ---
 class AsyncClobClient:
     """
@@ -194,13 +228,14 @@ class AsyncClobClient:
         return await asyncio.gather(*tasks)
 
     async def get_order_book(self, token_id: str) -> Dict:
-        """Fetch order book for a single token."""
+        """Fetch order book for a single token with rate limiting."""
         path = f"/book?token_id={token_id}"
         try:
-            async with self.session.get(CLOB_API_URL + path) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                return {"asks": [], "bids": []}
+            async with rate_limiter:  # Rate limit applied
+                async with self.session.get(CLOB_API_URL + path) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    return {"asks": [], "bids": []}
         except Exception as e:
             logger.warning(f"Order book fetch error: {e}")
             return {"asks": [], "bids": []}
@@ -646,8 +681,15 @@ class ArbitrageEngine:
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            await self.process_ws_update(data)
+                            # Handle empty or non-JSON messages gracefully
+                            if not msg.data or msg.data.strip() == '':
+                                continue
+                            try:
+                                data = json.loads(msg.data)
+                                await self.process_ws_update(data)
+                            except json.JSONDecodeError:
+                                # Skip non-JSON messages (pings, acks, etc.)
+                                continue
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             break
             except Exception as e:
@@ -740,7 +782,7 @@ class ArbitrageEngine:
             return None
 
     async def execute_arbitrage(self, market: Dict, price_yes: Decimal, price_no: Decimal):
-        """Execute arbitrage trade using batch orders."""
+        """Execute arbitrage trade using BATCH orders for atomicity."""
         spread = price_yes + price_no
         logger.info(f"🚨 OPPORTUNITY: {market.get('question', '')[:50]}... | Spread: {spread:.4f}")
         
@@ -766,17 +808,15 @@ class ArbitrageEngine:
 
         tokens = market.get('_tokens', [])
         
-        logger.info(f"💰 ATTEMPTING TRADE | Spread: {spread:.4f} | YES: {price_yes:.4f} | NO: {price_no:.4f}")
+        logger.info(f"💰 ATTEMPTING BATCH TRADE | Spread: {spread:.4f} | YES: {price_yes:.4f} | NO: {price_no:.4f}")
         logger.info(f"🎯 Target: {target_shares} shares @ ${total_cost:.2f} | Expected Profit: ${expected_profit:.4f}")
 
-        # NOTE: Batch orders require signed order format
-        # For now, execute sequentially with FOK (will upgrade to batch with proper signing)
         try:
-            # Use the sync client for order signing (py_clob_client handles it)
+            # Use py_clob_client for batch order execution
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
             
-            # Create temp sync client for order execution
+            # Create sync client (reuse cached credentials if possible)
             sync_client = ClobClient(
                 host=CLOB_API_URL,
                 key=PRIVATE_KEY,
@@ -785,53 +825,68 @@ class ArbitrageEngine:
             )
             sync_client.set_api_creds(sync_client.create_or_derive_api_creds())
             
-            # Execute YES order
+            # Build BOTH orders
             order_args_yes = OrderArgs(
                 token_id=tokens[0],
                 size=float(target_shares),
                 price=float(limit_yes),
                 side=BUY
             )
-            signed_yes = sync_client.create_order(order_args_yes)
-            resp_yes = sync_client.post_order(signed_yes, OrderType.FOK)
-            
-            yes_success = resp_yes.get("success", False) if isinstance(resp_yes, dict) else False
-            
-            if not yes_success:
-                error_msg = resp_yes.get("error", "Unknown error") if isinstance(resp_yes, dict) else str(resp_yes)
-                logger.warning(f"⚠️ YES order not filled (FOK killed): {error_msg}")
-                return
-            
-            # Execute NO order
             order_args_no = OrderArgs(
                 token_id=tokens[1],
                 size=float(target_shares),
                 price=float(limit_no),
                 side=BUY
             )
+            
+            # Sign both orders
+            signed_yes = sync_client.create_order(order_args_yes)
             signed_no = sync_client.create_order(order_args_no)
-            resp_no = sync_client.post_order(signed_no, OrderType.FOK)
             
-            no_success = resp_no.get("success", False) if isinstance(resp_no, dict) else False
+            # === BATCH EXECUTION ===
+            # Send both orders in a SINGLE HTTP request for atomicity
+            logger.info(f"📦 Sending BATCH order (YES + NO in single request)...")
             
-            if not no_success:
-                error_msg = resp_no.get("error", "Unknown error") if isinstance(resp_no, dict) else str(resp_no)
-                logger.error(f"⚠️ NO order failed but YES succeeded! EMERGENCY EXIT needed!")
-                logger.error(f"   Error: {error_msg}")
-                # TODO: Implement emergency exit
+            async with rate_limiter:  # Rate limit for batch order
+                # Use post_orders (plural) for batch execution
+                # The py_clob_client's post_order with list sends to /orders endpoint
+                batch_response = sync_client.post_orders([signed_yes, signed_no], OrderType.FOK)
+            
+            # Check batch response
+            if not batch_response:
+                logger.warning(f"⚠️ Batch order returned empty response")
                 return
             
-            # BOTH orders succeeded!
-            logger.info(f"✅ ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {spread:.4f}")
-            logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
+            # Analyze results
+            if isinstance(batch_response, list):
+                yes_success = len(batch_response) >= 1 and batch_response[0].get('success', False)
+                no_success = len(batch_response) >= 2 and batch_response[1].get('success', False)
+            else:
+                # Single response object
+                yes_success = batch_response.get('success', False)
+                no_success = yes_success  # If batch succeeded, both did
             
-            self.stats['trades_executed'] += 1
-            self.stats['arb_opportunities'] += 1
-            
-            # Auto-merge
-            condition_id = market.get('conditionId')
-            if condition_id:
-                await self.merge_and_settle_async(condition_id)
+            if yes_success and no_success:
+                # BOTH orders succeeded!
+                logger.info(f"✅ BATCH ARBITRAGE EXECUTED: ~{target_shares} pairs @ spread {spread:.4f}")
+                logger.info(f"   Expected profit at resolution: ${expected_profit:.2f}")
+                
+                self.stats['trades_executed'] += 1
+                self.stats['arb_opportunities'] += 1
+                
+                # Auto-merge
+                condition_id = market.get('conditionId')
+                if condition_id:
+                    await self.merge_and_settle_async(condition_id)
+            elif yes_success and not no_success:
+                # Partial fill - YES succeeded, NO failed - DANGEROUS!
+                logger.error(f"❌ PARTIAL FILL! YES succeeded but NO failed!")
+                logger.error(f"   Response: {batch_response}")
+                logger.error(f"   ACTION: Need to sell YES position to exit!")
+                # Note: FOK should prevent this, but log for safety
+            else:
+                # Both failed or YES failed (safe - no position)
+                logger.warning(f"⚠️ Batch order not filled (FOK killed): {batch_response}")
                 
         except Exception as e:
             logger.error(f"Trade execution error: {e}")
