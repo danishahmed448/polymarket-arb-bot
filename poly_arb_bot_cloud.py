@@ -777,16 +777,28 @@ class ArbitrageEngine:
         books = await self.async_client.get_order_books([token_yes, token_no])
         ob_yes, ob_no = books[0], books[1]
         
-        best_ask_yes = self._get_best_price(ob_yes, 'asks')
-        best_ask_no = self._get_best_price(ob_no, 'asks')
+        # Get price AND available size
+        price_yes_val, size_yes = self._get_best_price(ob_yes, 'asks')
+        price_no_val, size_no = self._get_best_price(ob_no, 'asks')
         
-        if not best_ask_yes or not best_ask_no:
+        if not price_yes_val or not price_no_val:
             return
 
         # Use Decimal for math
-        price_yes = Decimal(str(best_ask_yes))
-        price_no = Decimal(str(best_ask_no))
+        price_yes = Decimal(str(price_yes_val))
+        price_no = Decimal(str(price_no_val))
         total_cost = price_yes + price_no
+        
+        # === LIQUIDITY SAFETY CHECK ===
+        # Calculate target shares to check if enough liquidity exists
+        temp_target = float(BET_SIZE) / float(total_cost) if total_cost > 0 else 0
+        
+        # Skip if order book doesn't have enough shares (with 5% buffer)
+        if size_yes < (temp_target * 0.95) or size_no < (temp_target * 0.95):
+            # Only log if this was actually an arb opportunity we're skipping
+            if total_cost < MIN_SPREAD_TARGET:
+                logger.info(f"⚠️ Low Liquidity: Skipping. Need ~{temp_target:.1f} shares. Available: YES={size_yes:.1f}, NO={size_no:.1f}")
+            return
         
         # Update stats
         self.stats['checks'] += 1
@@ -815,16 +827,28 @@ class ArbitrageEngine:
             if profit >= PROFIT_THRESHOLD:
                 await self.execute_arbitrage(market, price_yes, price_no)
 
-    def _get_best_price(self, ob: Dict, side: str) -> Optional[float]:
-        """Get best ask/bid price from order book."""
+    def _get_best_price(self, ob: Dict, side: str) -> Tuple[Optional[float], float]:
+        """Get best ask/bid price AND available size from order book."""
         if not ob or side not in ob or not ob[side]:
-            return None
+            return None, 0.0
         try:
-            # Sort asks ascending (best ask is lowest price)
-            prices = sorted([float(p['price']) for p in ob[side] if float(p.get('size', 0)) > 0])
-            return prices[0] if prices else None
-        except:
-            return None
+            # Filter for valid orders with size > 0
+            valid_orders = [
+                {'price': float(p['price']), 'size': float(p['size'])}
+                for p in ob[side] if float(p.get('size', 0)) > 0
+            ]
+            
+            if not valid_orders:
+                return None, 0.0
+                
+            # Sort: Asks ascending (cheapest first)
+            valid_orders.sort(key=lambda x: x['price'])
+            
+            best_order = valid_orders[0]
+            return best_order['price'], best_order['size']
+        except Exception as e:
+            logger.warning(f"Error parsing orderbook: {e}")
+            return None, 0.0
 
     async def execute_arbitrage(self, market: Dict, price_yes: Decimal, price_no: Decimal):
         """Execute arbitrage trade using BATCH orders for atomicity."""
