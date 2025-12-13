@@ -3,3 +3,4 @@ requests
 pandas
 web3
 eth-account
+aiohttp
